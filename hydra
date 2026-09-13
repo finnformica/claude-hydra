@@ -31,7 +31,7 @@ SHARED_FILES="settings.json CLAUDE.md history.jsonl"
 
 # Claude's own subcommands: never routed unless a profile is named first.
 PASSTHROUGH="agents attach auth auto-mode doctor gateway import install logs mcp plugin plugins project respawn rm setup-token stop kill ultrareview update upgrade"
-HYDRA_CMDS="add login remove rm rename list ls names link status refresh pick dir has exec help"
+HYDRA_CMDS="add login remove rm rename enable disable list ls names link status refresh pick dir has exec help"
 RESERVED="auto best $HYDRA_CMDS $PASSTHROUGH"
 
 # ---------------------------------------------------------------- utilities
@@ -59,7 +59,7 @@ now() { date +%s; }
 
 # ---------------------------------------------------------------- manifest
 
-EMPTY_MANIFEST='{"version":1,"threshold":95,"weights":{"session":1,"fable":1},"reset_grace_minutes":10,"profiles":{}}'
+EMPTY_MANIFEST='{"version":1,"threshold":90,"weights":{"session":1,"fable":1,"weekly":1},"reset_grace_minutes":10,"default_model":"fable","profiles":{}}'
 
 manifest() { if [ -f "$HYDRA_MANIFEST" ]; then cat "$HYDRA_MANIFEST"; else printf '%s' "$EMPTY_MANIFEST"; fi; }
 
@@ -73,6 +73,8 @@ has_profile() { manifest | jq -e --arg n "$1" '.profiles[$n] != null' >/dev/null
 profile_names() { manifest | jq -r '.profiles | keys[]'; }
 profile_count() { manifest | jq -r '.profiles | length'; }
 profile_dir() { expand "$(manifest | jq -r --arg n "$1" '.profiles[$n].dir')"; }
+profile_disabled() { manifest | jq -e --arg n "$1" '.profiles[$n].disabled == true' >/dev/null 2>&1; }
+enabled_names() { manifest | jq -r '.profiles | to_entries[] | select(.value.disabled != true) | .key'; }
 is_default_dir() { [ "$1" = "$DEFAULT_DIR" ]; }
 
 require_profile() { has_profile "$1" || die "no profile named '$1' (hydra list)"; }
@@ -118,6 +120,33 @@ run_claude() {
   else CLAUDE_CONFIG_DIR="$dir" command claude "$@"; fi
 }
 
+# ---------------------------------------------------------------- model intent
+
+# "fable" → the Fable weekly window binds; anything else → only the 5-hour and
+# all-models weekly windows do. Resolved from --model, then $HYDRA_MODEL, then
+# the model in ~/.claude/settings.json, then the manifest's default_model.
+model_intent() {
+  local m="${1:-}"
+  [ -n "$m" ] || m="${HYDRA_MODEL:-}"
+  [ -n "$m" ] || m=$(jq -r '.model // empty' "$DEFAULT_DIR/settings.json" 2>/dev/null || true)
+  case "$m" in ''|default) m=$(manifest | jq -r '.default_model // "fable"') ;; esac
+  printf '%s' "$m" | tr '[:upper:]' '[:lower:]'
+}
+
+# Pulls the --model value out of a claude argument list, if any.
+model_from_args() {
+  local prev=""
+  for a in "$@"; do
+    case "$a" in
+      --model=*) printf '%s' "${a#--model=}"; return ;;
+    esac
+    [ "$prev" = "--model" ] && { printf '%s' "$a"; return; }
+    prev="$a"
+  done
+}
+
+model_label() { case "$1" in *fable*) printf 'fable' ;; *opus*) printf 'opus' ;; *sonnet*) printf 'sonnet' ;; *haiku*) printf 'haiku' ;; *) printf '%s' "$1" ;; esac; }
+
 # ---------------------------------------------------------------- usage
 
 claude_version() { command claude --version 2>/dev/null | awk '{print $1}'; }
@@ -145,7 +174,7 @@ fetch_usage() {
           fetched_at: ($at | tonumber), source: "api", auth: "ok",
           limits: .limits,
           locked: ([.five_hour.locked_reason, .seven_day.locked_reason] | map(select(. != null)))
-        }' "$tmp" >"$cache"
+        }' "$tmp" >"$tmp.2" && mv "$tmp.2" "$cache"   # atomic: a launch may be reading it
         printf 'ok'
       else
         printf 'bad-response'
@@ -178,22 +207,23 @@ JQ_LIB='
 # One normalised usage record per profile, from whichever is newer: hydra'"'"'s
 # own cache or the snapshot Claude Code writes after each session.
 snapshot() {
-  local name="$1" dir hydra_cache claude_cache signed
+  local name="$1" dir hydra_cache claude_cache signed disabled
   dir=$(profile_dir "$name")
   signed=false; signed_in "$dir" && signed=true
-  hydra_cache=$(cat "$CACHE_DIR/$name.json" 2>/dev/null || printf 'null')
+  disabled=false; profile_disabled "$name" && disabled=true
+  hydra_cache=$(jq -c . "$CACHE_DIR/$name.json" 2>/dev/null || printf 'null')
   claude_cache=$(jq -c '.cachedUsageUtilization // null
     | if . == null or .utilization == null then null
       else {fetched_at: ((.fetchedAtMs // 0) / 1000 | floor), source: "claude", auth: "ok",
             limits: (.utilization.limits // []),
             locked: ([.utilization.five_hour.locked_reason, .utilization.seven_day.locked_reason] | map(select(. != null)))}
       end' "$(claude_json "$dir")" 2>/dev/null || printf 'null')
-  jq -n --arg name "$name" --arg dir "$dir" --argjson signed "$signed" \
+  jq -n --arg name "$name" --arg dir "$dir" --argjson signed "$signed" --argjson disabled "$disabled" \
     --argjson h "$hydra_cache" --argjson c "$claude_cache" --arg email "$(account_email "$dir")" "$JQ_LIB"'
     ([$h, $c] | map(select(. != null)) | sort_by(.fetched_at) | last) as $u
     | ($u // {fetched_at: 0, source: null, auth: "unknown", limits: [], locked: []})
     | {
-        name: $name, dir: $dir, email: $email, signed_in: $signed,
+        name: $name, dir: $dir, email: $email, signed_in: $signed, disabled: $disabled,
         fetched_at, source, auth,
         locked: ((.locked // []) | length > 0),
         session: bucket(.kind == "session"),
@@ -217,7 +247,7 @@ refresh() {
   while [ $# -gt 0 ]; do
     case "$1" in --force) force=1 ;; --stale) ;; *) names="$names $1" ;; esac; shift
   done
-  [ -n "$names" ] || names=$(profile_names | tr '\n' ' ')
+  [ -n "$names" ] || names=$(enabled_names | tr '\n' ' ')
   t=$(now)
   CLAUDE_VERSION=$(claude_version); export CLAUDE_VERSION
   for n in $names; do
@@ -232,21 +262,25 @@ refresh() {
   SNAPSHOTS=""
 }
 
-# Ranks signed-in profiles; prints one JSON object for the winner.
-#   score = max(session × w_session, fable × w_fable)
-#   ties within 5 points → lower weekly, then the soonest 5-hour reset
+# Ranks enabled, signed-in profiles; prints one JSON object for the winner.
+#   Fable session:  score = max(session × w_session, fable × w_fable); ties → weekly
+#   other model:    score = max(session × w_session, weekly × w_weekly); Fable ignored
+#   ties within 5 points → the soonest 5-hour reset
 #   anything at/over the threshold, or locked, is only used when nothing else is
 pick_json() {
-  snapshots | jq -c --argjson cfg "$(manifest)" --argjson now "$(now)" "$JQ_LIB"'
-    ($cfg.threshold // 95) as $threshold
+  local intent; intent=$(model_label "$(model_intent "${1:-}")")
+  snapshots | jq -c --argjson cfg "$(manifest)" --argjson now "$(now)" --arg intent "$intent" "$JQ_LIB"'
+    ($cfg.threshold // 90) as $threshold
     | (($cfg.reset_grace_minutes // 10) * 60) as $grace
     | ($cfg.weights.session // 1) as $ws
     | ($cfg.weights.fable // 1) as $wf
-    | map(select(.signed_in))
-    | map(. + {s: eff(.session; $grace), w: eff(.weekly; 0), f: eff(.fable; 0)})
-    | map(. + {known: (.session != null)})
+    | ($cfg.weights.weekly // 1) as $ww
+    | ($intent == "fable") as $fable
+    | map(select(.signed_in and (.disabled | not)))
+    | map(. + {s: eff(.session; $grace), w: eff(.weekly; 0), f: (if $fable then eff(.fable; 0) else null end)})
+    | map(. + {known: (.session != null), intent: $intent})
     | map(. + {exhausted: (.locked or (([.s, .w, .f] | map(. // 0) | max) >= $threshold))})
-    | map(. + {score: ([(.s // 0) * $ws, (.f // 0) * $wf] | max)})
+    | map(. + {score: (if $fable then [(.s // 0) * $ws, (.f // 0) * $wf] else [(.s // 0) * $ws, (.w // 0) * $ww] end | max)})
     | (map(select(.exhausted | not)) as $ok | if ($ok | length) > 0 then $ok else . end)
     | sort_by([(if .known then 0 else 1 end), (.score / 5 | floor), (.w // 0), (.session.resets // 0)])
     | .[0] // empty'
@@ -374,9 +408,23 @@ cmd_rename() {
   say "renamed '$old' → '$new'"
 }
 
+cmd_disable() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: hydra disable <name>"
+  require_profile "$name"
+  manifest | jq --arg n "$name" '.profiles[$n].disabled = true' | save_manifest
+  say "'$name' is out of the rotation (claude $name still works)"
+}
+
+cmd_enable() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: hydra enable <name>"
+  require_profile "$name"
+  manifest | jq --arg n "$name" 'del(.profiles[$n].disabled)' | save_manifest
+  say "'$name' is back in the rotation"
+}
+
 cmd_list() {
-  manifest | jq -r '.profiles | to_entries[] | "\(.key)\t\(.value.dir)\t\(.value.email // "")"' |
-    awk -F'\t' '{printf "%-16s %-32s %s\n", $1, $2, $3}'
+  manifest | jq -r '.profiles | to_entries[] | "\(.key)\t\(.value.dir)\t\(.value.email // "")\t\(if .value.disabled then "disabled" else "" end)"' |
+    awk -F'\t' '{printf "%-16s %-32s %-30s %s\n", $1, $2, $3, $4}'
 }
 
 cmd_link() {
@@ -398,7 +446,7 @@ cmd_status() {
   if [ "$cached" -eq 0 ]; then
     if [ "$force" -eq 1 ]; then refresh --force >/dev/null; else refresh --stale >/dev/null; fi
   fi
-  local threshold; threshold=$(manifest | jq -r '.threshold // 95')
+  local threshold; threshold=$(manifest | jq -r '.threshold // 90')
   printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE STATE
   snapshots | jq -r --argjson now "$(now)" --argjson threshold "$threshold" "$JQ_LIB"'
     .[] | [
@@ -407,6 +455,7 @@ cmd_status() {
       (if .session.resets then (.session.resets - $now) else "null" end),
       (if .fetched_at > 0 then ($now - .fetched_at) else "null" end),
       (if (.signed_in | not) then "not signed in on this machine"
+       elif .disabled then "disabled"
        elif .locked then "locked"
        elif ([.session.pct, .weekly.pct, .fable.pct] | map(. // 0) | max) >= $threshold then "exhausted"
        elif .auth == "stale" then "token stale — refreshes on next launch"
@@ -421,10 +470,13 @@ cmd_status() {
 }
 
 cmd_pick() {
-  local json=0; [ "${1:-}" = "--json" ] && json=1
+  local json=0 model=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --json) json=1 ;; --model) shift; model="${1:-}" ;; --model=*) model="${1#--model=}" ;; *) die "usage: hydra pick [--json] [--model M]" ;; esac; shift
+  done
   [ "$(profile_count)" -gt 0 ] || die "no profiles yet — hydra add <name>"
   ensure_usage
-  local p; p=$(pick_json) || true
+  local p; p=$(pick_json "$model") || true
   [ -n "$p" ] || die "no signed-in profile on this machine"
   if [ "$json" -eq 1 ]; then printf '%s\n' "$p"; else printf '%s\n' "$p" | jq -r .name; fi
 }
@@ -433,7 +485,7 @@ cmd_pick() {
 # with no data at all, so the pick is never blind.
 ensure_usage() {
   local missing
-  missing=$(snapshots | jq -r '.[] | select(.signed_in and .fetched_at == 0) | .name')
+  missing=$(snapshots | jq -r '.[] | select(.signed_in and (.disabled | not) and .fetched_at == 0) | .name')
   [ -n "$missing" ] && refresh --force $missing >/dev/null 2>&1 || true
 }
 
@@ -441,7 +493,7 @@ ensure_usage() {
 background_refresh() {
   local stale
   stale=$(snapshots | jq -r --argjson now "$(now)" --argjson min "$MIN_REFRESH_S" \
-    '.[] | select(.signed_in and ($now - .fetched_at) >= $min) | .name' | tr '\n' ' ')
+    '.[] | select(.signed_in and (.disabled | not) and ($now - .fetched_at) >= $min) | .name' | tr '\n' ' ')
   [ -n "${stale// /}" ] || return 0
   ( "$0" refresh --force $stale >/dev/null 2>&1 & ) >/dev/null 2>&1
 }
@@ -461,13 +513,13 @@ cmd_exec() {
 
   if [ -z "$name" ]; then
     ensure_usage
-    local p; p=$(pick_json) || true
+    local p; p=$(pick_json "$(model_from_args "$@")") || true
     if [ -z "$p" ]; then
       hint "hydra: no signed-in profile on this machine — launching with default config"
       exec command claude "$@"
     fi
     name=$(printf '%s' "$p" | jq -r .name)
-    hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%   Fable \(.f // "-")%\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
+    hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%\(if .intent == "fable" then "   Fable \(.f // "-")%" else "   (\(.intent): Fable window ignored)" end)\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
   fi
 
   background_refresh
@@ -485,11 +537,14 @@ hydra — many heads, one Claude Code
   hydra login <name>          sign in / re-authenticate a profile
   hydra remove <name> [--keep-files]
   hydra rename <old> <new>    relabel a profile (its sign-in is untouched)
+  hydra disable <name>        keep it signed in but out of the rotation
+  hydra enable <name>         put it back
   hydra list                  profiles and their config dirs
   hydra status [--cached|--force]
                               usage per profile (refreshes anything older than 3 min)
   hydra refresh [names…] [--force]
-  hydra pick [--json]         which profile a bare `claude` would use right now
+  hydra pick [--json] [--model M]
+                              which profile a bare `claude` (or `claude --model M`) would use
   hydra link [names…] [--force]
                               (re)apply the shared-config symlinks
   hydra dir <name>            print a profile's config dir
@@ -499,7 +554,8 @@ hydra — many heads, one Claude Code
   hydra <profile> [claude args…]
                               shorthand for hydra exec <profile> …
 
-Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_QUIET=1 (no routing hint)
+Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_QUIET=1 (no routing hint),
+             HYDRA_MODEL (score for this model when no --model is passed)
 EOF
 }
 
@@ -508,6 +564,8 @@ case "${1:-help}" in
   login)   shift; cmd_login "$@" ;;
   remove|rm) shift; cmd_remove "$@" ;;
   rename)  shift; cmd_rename "$@" ;;
+  enable)  shift; cmd_enable "$@" ;;
+  disable) shift; cmd_disable "$@" ;;
   list|ls) cmd_list ;;
   names)   profile_names ;;
   link)    shift; cmd_link "$@" ;;

@@ -51,10 +51,11 @@ hydra status
 | `hydra login <name>` | sign in, or sign in again when a token has expired |
 | `hydra remove <name> [--keep-files]` | delete the profile, its Keychain entry and its directory |
 | `hydra rename <old> <new>` | relabel a profile; its sign-in is untouched |
+| `hydra disable <name>` · `hydra enable <name>` | keep a profile signed in but out of the rotation (`claude <name>` still works) |
 | `hydra list` | profiles and their config dirs |
 | `hydra status [--cached\|--force]` | usage table; refreshes anything older than 3 minutes |
 | `hydra refresh [names…] [--force]` | fetch usage now |
-| `hydra pick [--json]` | which profile a bare `claude` would use right now |
+| `hydra pick [--json] [--model M]` | which profile a bare `claude` (or `claude --model M`) would use right now |
 | `hydra link [names…] [--force]` | (re)apply the shared-config symlinks |
 | `hydra dir <name>` · `hydra has <name>` | plumbing for scripts |
 | `hydra exec [profile] [claude args…]` | what the `claude` shell function calls |
@@ -63,39 +64,50 @@ hydra status
 Tab completion (zsh and bash) comes with `hydra.sh`: `hydra <Tab>` offers
 commands and profiles, `hydra login <Tab>` and `claude <Tab>` offer profiles.
 
-`HYDRA_QUIET=1` suppresses the one-line routing hint. `HYDRA_HOME` (default
+`HYDRA_QUIET=1` suppresses the one-line routing hint. `HYDRA_MODEL=opus`
+scores launches for that model when no `--model` is passed. `HYDRA_HOME` (default
 `~/.hydra`) and `HYDRA_MANIFEST` (default `$HYDRA_HOME/profiles.json`) move the
 state.
 
 ## How a profile is chosen
 
-For each signed-in profile hydra takes the three percentages Claude Code shows
-in `/usage`, then:
+For each enabled, signed-in profile hydra takes the three percentages Claude
+Code shows in `/usage`, then:
 
 1. A window that has already reset — or a 5-hour window resetting in the next
    10 minutes — counts as 0 %.
-2. Profiles at or over the threshold (95 %) or locked are set aside, unless
+2. Profiles at or over the threshold (90 %) or locked are set aside, unless
    *every* profile is.
-3. `score = max(session × w_session, fable × w_fable)` — the 5-hour window and
-   the Fable window are both first-class; whichever is the binding constraint
-   decides.
+3. The score depends on the model the session will use:
+   - **Fable** — `max(session × w_session, fable × w_fable)`: the 5-hour window
+     and the Fable weekly window are both first-class; whichever binds decides.
+   - **anything else** (`--model opus`, `sonnet`, …) — the Fable window is
+     irrelevant, so `max(session × w_session, weekly × w_weekly)`; a profile whose
+     Fable window is spent is a perfectly good Opus profile.
 4. Ties within 5 points go to the lower all-models weekly figure, then to the
    soonest 5-hour reset.
 
-Threshold, weights and grace live in `profiles.json`:
+The model is read from `--model` in the arguments, else `$HYDRA_MODEL`, else
+the `model` in `~/.claude/settings.json`, else `default_model` in the manifest.
+
+Threshold, weights, grace and default model live in `profiles.json`:
 
 ```json
 {
   "version": 1,
-  "threshold": 95,
-  "weights": { "session": 1, "fable": 1 },
+  "threshold": 90,
+  "weights": { "session": 1, "fable": 1, "weekly": 1 },
   "reset_grace_minutes": 10,
+  "default_model": "fable",
   "profiles": {
     "personal": { "dir": "~/.claude", "email": "you@example.com" },
-    "work":     { "dir": "~/.hydra/profiles/work", "email": "you@work.example" }
+    "work":     { "dir": "~/.hydra/profiles/work", "email": "you@work.example", "disabled": true }
   }
 }
 ```
+
+A disabled profile stays signed in and shows in `hydra status`, but is never
+auto-picked; `claude work` still launches it explicitly.
 
 The choice is made once per launch. A running session is bound to one account
 and cannot hop; when it hits a limit, start a new `claude` and hydra routes you

@@ -24,7 +24,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
     local -a cmds
     cmds=(
       'add:new profile' 'login:sign in / re-authenticate' 'remove:delete a profile'
-      'rename:relabel a profile' 'list:profiles and config dirs' 'status:usage per profile'
+      'rename:relabel a profile' 'enable:put a profile back in the rotation' 'disable:take a profile out of the rotation' 'list:profiles and config dirs' 'status:usage per profile'
       'refresh:fetch usage now' 'pick:which profile a bare claude would use'
       'link:reapply shared-config symlinks' 'dir:print a config dir' 'exec:launch claude on a profile'
       'help:show help'
@@ -34,7 +34,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
       _hydra_profiles
     else
       case "${words[2]}" in
-        login|remove|rm|rename|dir|has|refresh|link|exec) _hydra_profiles ;;
+        login|remove|rm|rename|enable|disable|dir|has|refresh|link|exec) _hydra_profiles ;;
         add) [[ "${words[CURRENT]}" == -* ]] && compadd -- --existing --dir --no-login ;;
         status) compadd -- --cached --force ;;
         *) _files ;;
@@ -56,12 +56,12 @@ if [ -n "${ZSH_VERSION:-}" ]; then
 elif [ -n "${BASH_VERSION:-}" ]; then
   _hydra_bash() {
     local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
-    local cmds="add login remove rename list status refresh pick link dir exec help"
+    local cmds="add login remove rename enable disable list status refresh pick link dir exec help"
     if [ "$COMP_CWORD" -eq 1 ]; then
       COMPREPLY=($(compgen -W "$cmds $(hydra names 2>/dev/null)" -- "$cur"))
     else
       case "$cmd" in
-        login|remove|rm|rename|dir|has|refresh|link|exec)
+        login|remove|rm|rename|enable|disable|dir|has|refresh|link|exec)
           COMPREPLY=($(compgen -W "$(hydra names 2>/dev/null)" -- "$cur")) ;;
         *) COMPREPLY=($(compgen -f -- "$cur")) ;;
       esac
