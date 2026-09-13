@@ -390,6 +390,7 @@ cmd_login() {
   seed_state "$dir"
   say "signing in '$name'…"
   run_claude "$dir" auth login
+  seed_state "$dir"   # again: the login may have rewritten the state file
   record_email "$name"
   CLAUDE_VERSION=$(claude_version) fetch_usage "$name" >/dev/null || true
   say "signed in '$name' as $(account_email "$dir")"
