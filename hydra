@@ -504,14 +504,14 @@ background_refresh() {
 
 cmd_exec() {
   # An explicit CLAUDE_CONFIG_DIR is the caller's decision; don't second-guess it.
-  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ "$(profile_count)" -eq 0 ]; then exec command claude "$@"; fi
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ "$(profile_count)" -eq 0 ]; then exec claude "$@"; fi
 
   local name=""
   if [ $# -gt 0 ]; then
     if has_profile "$1"; then name="$1"; shift
     else
-      case " $PASSTHROUGH " in *" $1 "*) exec command claude "$@" ;; esac
-      case "$1" in --version|-v|--help|-h) exec command claude "$@" ;; esac
+      case " $PASSTHROUGH " in *" $1 "*) exec claude "$@" ;; esac
+      case "$1" in --version|-v|--help|-h) exec claude "$@" ;; esac
     fi
   fi
 
@@ -520,7 +520,7 @@ cmd_exec() {
     local p; p=$(pick_json "$(model_from_args "$@")") || true
     if [ -z "$p" ]; then
       hint "hydra: no signed-in profile on this machine — launching with default config"
-      exec command claude "$@"
+      exec claude "$@"
     fi
     name=$(printf '%s' "$p" | jq -r .name)
     hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%\(if .intent == "fable" then "   Fable \(.f // "-")%" else "   (\(.intent): Fable window ignored)" end)\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
@@ -528,8 +528,8 @@ cmd_exec() {
 
   background_refresh
   local dir; dir=$(profile_dir "$name")
-  if is_default_dir "$dir"; then exec command claude "$@"
-  else export CLAUDE_CONFIG_DIR="$dir"; exec command claude "$@"; fi
+  if is_default_dir "$dir"; then exec claude "$@"
+  else export CLAUDE_CONFIG_DIR="$dir"; exec claude "$@"; fi
 }
 
 cmd_help() {
