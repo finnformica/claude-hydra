@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+# hydra — many heads, one Claude Code.
+#
+# Keeps one Claude Code config directory per subscription and routes every
+# `claude` launch to the account with the most headroom (5-hour window, weekly
+# window, and the Fable weekly window), or to the profile you name.
+#
+#   hydra add work           create a profile and sign it in
+#   hydra status             usage per profile
+#   claude                   launch on the freshest profile (via hydra.sh)
+#   claude work --resume     launch on a named profile
+#
+# State lives in $HYDRA_HOME (default ~/.hydra); nothing secret is written
+# there — tokens stay wherever Claude Code keeps them (the macOS Keychain, or
+# <config dir>/.credentials.json on Linux).
+
+set -euo pipefail
+
+HYDRA_HOME="${HYDRA_HOME:-$HOME/.hydra}"
+HYDRA_MANIFEST="${HYDRA_MANIFEST:-$HYDRA_HOME/profiles.json}"
+CACHE_DIR="$HYDRA_HOME/cache"
+PROFILES_DIR="$HYDRA_HOME/profiles"
+DEFAULT_DIR="$HOME/.claude"
+
+USAGE_URL="https://api.anthropic.com/api/oauth/usage"
+MIN_REFRESH_S=180 # the usage endpoint rate-limits anything faster than this
+
+# Shared between every profile, by symlink into ~/.claude.
+SHARED_DIRS="skills plugins projects commands agents"
+SHARED_FILES="settings.json CLAUDE.md history.jsonl"
+
+# Claude's own subcommands: never routed unless a profile is named first.
+PASSTHROUGH="agents attach auth auto-mode doctor gateway import install logs mcp plugin plugins project respawn rm setup-token stop kill ultrareview update upgrade"
+RESERVED="auto best exec $PASSTHROUGH"
+
+# ---------------------------------------------------------------- utilities
+
+die() { printf 'hydra: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*" >&2; }
+hint() { [ -n "${HYDRA_QUIET:-}" ] || printf '%s\n' "$*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "needs $1 on PATH"; }
+
+need jq
+need curl
+
+darwin() { [ "$(uname -s)" = Darwin ]; }
+
+sha8() {
+  if command -v shasum >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 256 | cut -c1-8
+  else printf '%s' "$1" | sha256sum | cut -c1-8; fi
+}
+
+# ~ in the manifest keeps it portable between machines with different usernames.
+expand() { case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s%s' "$HOME" "${1#"~"}" ;; *) printf '%s' "$1" ;; esac; }
+contract() { case "$1" in "$HOME") printf '~' ;; "$HOME/"*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
+now() { date +%s; }
+
+# ---------------------------------------------------------------- manifest
+
+EMPTY_MANIFEST='{"version":1,"threshold":95,"weights":{"session":1,"fable":1},"reset_grace_minutes":10,"profiles":{}}'
+
+manifest() { if [ -f "$HYDRA_MANIFEST" ]; then cat "$HYDRA_MANIFEST"; else printf '%s' "$EMPTY_MANIFEST"; fi; }
+
+save_manifest() {
+  mkdir -p "$(dirname "$HYDRA_MANIFEST")"
+  local tmp="$HYDRA_MANIFEST.tmp.$$"
+  jq . >"$tmp" && mv "$tmp" "$HYDRA_MANIFEST"
+}
+
+has_profile() { manifest | jq -e --arg n "$1" '.profiles[$n] != null' >/dev/null 2>&1; }
+profile_names() { manifest | jq -r '.profiles | keys[]'; }
+profile_count() { manifest | jq -r '.profiles | length'; }
+profile_dir() { expand "$(manifest | jq -r --arg n "$1" '.profiles[$n].dir')"; }
+is_default_dir() { [ "$1" = "$DEFAULT_DIR" ]; }
+
+require_profile() { has_profile "$1" || die "no profile named '$1' (hydra list)"; }
+
+valid_name() {
+  case "$1" in
+    ''|-*|*[!a-z0-9_-]*) return 1 ;;
+  esac
+  case " $RESERVED " in *" $1 "*) return 1 ;; esac
+  return 0
+}
+
+# ---------------------------------------------------------------- credentials
+
+# Claude Code namespaces its Keychain item by the *exact* CLAUDE_CONFIG_DIR
+# string it was launched with, so hydra must always export the same string it
+# hashes here: the expanded, unresolved path with no trailing slash.
+service_name() {
+  if is_default_dir "$1"; then printf 'Claude Code-credentials'
+  else printf 'Claude Code-credentials-%s' "$(sha8 "$1")"; fi
+}
+
+# Prints the credential blob for a config dir; fails when not signed in.
+credentials() {
+  local dir="$1"
+  if darwin; then
+    security find-generic-password -s "$(service_name "$dir")" -w 2>/dev/null && return 0
+  fi
+  [ -f "$dir/.credentials.json" ] && cat "$dir/.credentials.json"
+}
+
+signed_in() { credentials "$1" >/dev/null 2>&1; }
+
+# Claude keeps the default profile's state file *beside* ~/.claude, not inside it.
+claude_json() { if is_default_dir "$1"; then printf '%s/.claude.json' "$HOME"; else printf '%s/.claude.json' "$1"; fi; }
+
+account_email() { jq -r '.oauthAccount.emailAddress // empty' "$(claude_json "$1")" 2>/dev/null || true; }
+
+# Runs the real claude binary inside a profile's config dir.
+run_claude() {
+  local dir="$1"; shift
+  if is_default_dir "$dir"; then command claude "$@"
+  else CLAUDE_CONFIG_DIR="$dir" command claude "$@"; fi
+}
+
+# ---------------------------------------------------------------- usage
+
+claude_version() { command claude --version 2>/dev/null | awk '{print $1}'; }
+
+# Fetches /api/oauth/usage for one profile into the cache. Prints a status word.
+fetch_usage() {
+  local name="$1" dir token code creds
+  dir=$(profile_dir "$name")
+  creds=$(credentials "$dir") || { printf 'no-auth'; return 0; }
+  token=$(printf '%s' "$creds" | jq -r '.claudeAiOauth.accessToken // empty')
+  [ -n "$token" ] || { printf 'no-auth'; return 0; }
+
+  mkdir -p "$CACHE_DIR"
+  local tmp="$CACHE_DIR/$name.tmp.$$" cache="$CACHE_DIR/$name.json"
+  code=$(curl -sS -m 10 -o "$tmp" -w '%{http_code}' "$USAGE_URL" \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "User-Agent: claude-code/${CLAUDE_VERSION:-$(claude_version)}" \
+    -H "Content-Type: application/json" 2>/dev/null) || code=000
+
+  case "$code" in
+    200)
+      if jq -e '.limits | type == "array"' "$tmp" >/dev/null 2>&1; then
+        jq --arg at "$(now)" '{
+          fetched_at: ($at | tonumber), source: "api", auth: "ok",
+          limits: .limits,
+          locked: ([.five_hour.locked_reason, .seven_day.locked_reason] | map(select(. != null)))
+        }' "$tmp" >"$cache"
+        printf 'ok'
+      else
+        printf 'bad-response'
+      fi ;;
+    401)
+      # The access token has lapsed; Claude refreshes it itself on next launch.
+      if [ -f "$cache" ]; then jq '.auth = "stale"' "$cache" >"$tmp.2" && mv "$tmp.2" "$cache"
+      else printf '{"fetched_at":0,"source":"api","auth":"stale","limits":[],"locked":[]}' >"$cache"; fi
+      printf 'stale' ;;
+    429) printf 'rate-limited' ;;
+    000) printf 'offline' ;;
+    *) printf 'http-%s' "$code" ;;
+  esac
+  rm -f "$tmp"
+}
+
+# jq prelude shared by snapshot/pick/status.
+JQ_LIB='
+  def ts: if . == null then null
+          else (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | sub("Z?$"; "Z") | fromdateiso8601) end;
+  def bucket(f): ([.limits[]? | select(f)] | .[0]) as $b
+                 | if $b == null then null
+                   else {pct: ($b.percent // 0), resets: ($b.resets_at | ts), severity: $b.severity} end;
+  # A window that has already reset (or is about to) counts as empty.
+  def eff(b; grace): if b == null then null
+                     elif (b.resets != null and b.resets <= $now + grace) then 0
+                     else b.pct end;
+'
+
+# One normalised usage record per profile, from whichever is newer: hydra'"'"'s
+# own cache or the snapshot Claude Code writes after each session.
+snapshot() {
+  local name="$1" dir hydra_cache claude_cache signed
+  dir=$(profile_dir "$name")
+  signed=false; signed_in "$dir" && signed=true
+  hydra_cache=$(cat "$CACHE_DIR/$name.json" 2>/dev/null || printf 'null')
+  claude_cache=$(jq -c '.cachedUsageUtilization // null
+    | if . == null or .utilization == null then null
+      else {fetched_at: ((.fetchedAtMs // 0) / 1000 | floor), source: "claude", auth: "ok",
+            limits: (.utilization.limits // []),
+            locked: ([.utilization.five_hour.locked_reason, .utilization.seven_day.locked_reason] | map(select(. != null)))}
+      end' "$(claude_json "$dir")" 2>/dev/null || printf 'null')
+  jq -n --arg name "$name" --arg dir "$dir" --argjson signed "$signed" \
+    --argjson h "$hydra_cache" --argjson c "$claude_cache" --arg email "$(account_email "$dir")" "$JQ_LIB"'
+    ([$h, $c] | map(select(. != null)) | sort_by(.fetched_at) | last) as $u
+    | ($u // {fetched_at: 0, source: null, auth: "unknown", limits: [], locked: []})
+    | {
+        name: $name, dir: $dir, email: $email, signed_in: $signed,
+        fetched_at, source, auth,
+        locked: ((.locked // []) | length > 0),
+        session: bucket(.kind == "session"),
+        weekly:  bucket(.kind == "weekly_all"),
+        fable:   bucket(.kind == "weekly_scoped" and ((.scope.model.display_name // "") | ascii_downcase) == "fable")
+      }'
+}
+
+SNAPSHOTS=""
+snapshots() {
+  if [ -z "$SNAPSHOTS" ]; then
+    local n
+    SNAPSHOTS=$(for n in $(profile_names); do snapshot "$n"; done | jq -s .)
+  fi
+  printf '%s' "$SNAPSHOTS"
+}
+
+# Refreshes profiles whose data is older than MIN_REFRESH_S (or all with --force).
+refresh() {
+  local force=0 names="" n status t age
+  while [ $# -gt 0 ]; do
+    case "$1" in --force) force=1 ;; --stale) ;; *) names="$names $1" ;; esac; shift
+  done
+  [ -n "$names" ] || names=$(profile_names | tr '\n' ' ')
+  t=$(now)
+  CLAUDE_VERSION=$(claude_version); export CLAUDE_VERSION
+  for n in $names; do
+    require_profile "$n"
+    if [ "$force" -eq 0 ]; then
+      age=$(( t - $(snapshot "$n" | jq -r '.fetched_at') ))
+      [ "$age" -ge "$MIN_REFRESH_S" ] || { printf '%-12s fresh (%ss ago)\n' "$n" "$age"; continue; }
+    fi
+    status=$(fetch_usage "$n")
+    printf '%-12s %s\n' "$n" "$status"
+  done
+  SNAPSHOTS=""
+}
+
+# Ranks signed-in profiles; prints one JSON object for the winner.
+#   score = max(session × w_session, fable × w_fable)
+#   ties within 5 points → lower weekly, then the soonest 5-hour reset
+#   anything at/over the threshold, or locked, is only used when nothing else is
+pick_json() {
+  snapshots | jq -c --argjson cfg "$(manifest)" --argjson now "$(now)" "$JQ_LIB"'
+    ($cfg.threshold // 95) as $threshold
+    | (($cfg.reset_grace_minutes // 10) * 60) as $grace
+    | ($cfg.weights.session // 1) as $ws
+    | ($cfg.weights.fable // 1) as $wf
+    | map(select(.signed_in))
+    | map(. + {s: eff(.session; $grace), w: eff(.weekly; 0), f: eff(.fable; 0)})
+    | map(. + {known: (.session != null)})
+    | map(. + {exhausted: (.locked or (([.s, .w, .f] | map(. // 0) | max) >= $threshold))})
+    | map(. + {score: ([(.s // 0) * $ws, (.f // 0) * $wf] | max)})
+    | (map(select(.exhausted | not)) as $ok | if ($ok | length) > 0 then $ok else . end)
+    | sort_by([(if .known then 0 else 1 end), (.score / 5 | floor), (.w // 0), (.session.resets // 0)])
+    | .[0] // empty'
+}
+
+fmt_pct() { if [ "$1" = "null" ] || [ -z "$1" ]; then printf '   -'; else printf '%3s%%' "$1"; fi; }
+
+fmt_in() { # seconds → "2h13m" / "3d"
+  local s="$1"
+  if [ "$s" = "null" ] || [ -z "$s" ]; then printf '-'; return; fi
+  [ "$s" -gt 0 ] || { printf 'now'; return; }
+  if [ "$s" -ge 86400 ]; then printf '%dd%dh' $((s / 86400)) $((s % 86400 / 3600))
+  elif [ "$s" -ge 3600 ]; then printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+  else printf '%dm' $((s / 60)); fi
+}
+
+# ---------------------------------------------------------------- linking
+
+# Symlinks the shared parts of ~/.claude into a profile dir. Idempotent.
+link_shared() {
+  local dir="$1" force="${2:-0}" item src dst
+  is_default_dir "$dir" && return 0
+  mkdir -p "$dir"
+  for item in $SHARED_DIRS $SHARED_FILES; do
+    src="$DEFAULT_DIR/$item"; dst="$dir/$item"
+    case " $SHARED_DIRS " in *" $item "*) mkdir -p "$src" ;; esac
+    [ -e "$src" ] || continue
+    if [ -L "$dst" ]; then
+      [ "$(readlink "$dst")" = "$src" ] || { rm "$dst"; ln -s "$src" "$dst"; say "  relinked $item"; }
+    elif [ -e "$dst" ]; then
+      if [ "$force" -eq 1 ]; then
+        mv "$dst" "$dst.hydra-bak"; ln -s "$src" "$dst"; say "  replaced $item (old copy at $item.hydra-bak)"
+      else
+        say "  ! $item is a real file in this profile, not a link to ~/.claude — hydra link --force to replace it"
+      fi
+    else
+      ln -s "$src" "$dst"; say "  linked $item"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_add() {
+  local name="" dir="" existing=0 login=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --existing|--default) existing=1 ;;
+      --dir) shift; dir="$1" ;;
+      --no-login) login=0 ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$name" ] && name="$1" || die "unexpected argument $1" ;;
+    esac; shift
+  done
+  [ -n "$name" ] || die "usage: hydra add <name> [--existing | --dir PATH] [--no-login]"
+  valid_name "$name" || die "'$name' is not a usable name (lowercase letters, digits, - and _; not a claude subcommand)"
+  has_profile "$name" && die "profile '$name' already exists"
+
+  if [ "$existing" -eq 1 ]; then dir="$DEFAULT_DIR"
+  elif [ -z "$dir" ]; then dir="$PROFILES_DIR/$name"
+  else dir=$(expand "$dir"); dir="${dir%/}"; fi
+
+  manifest | jq --arg n "$name" --arg d "$(contract "$dir")" '.profiles[$n] = {dir: $d}' | save_manifest
+  say "added '$name' → $(contract "$dir")"
+  link_shared "$dir"
+
+  if [ "$login" -eq 1 ] && ! signed_in "$dir"; then cmd_login "$name"
+  else record_email "$name"; fi
+}
+
+record_email() {
+  local name="$1" email
+  email=$(account_email "$(profile_dir "$name")")
+  [ -n "$email" ] || return 0
+  manifest | jq --arg n "$name" --arg e "$email" '.profiles[$n].email = $e' | save_manifest
+}
+
+cmd_login() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: hydra login <name>"
+  require_profile "$name"
+  local dir; dir=$(profile_dir "$name")
+  link_shared "$dir"
+  say "signing in '$name'…"
+  run_claude "$dir" auth login
+  record_email "$name"
+  CLAUDE_VERSION=$(claude_version) fetch_usage "$name" >/dev/null || true
+  say "signed in '$name' as $(account_email "$dir")"
+}
+
+cmd_remove() {
+  local name="" keep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --keep-files) keep=1 ;; -*) die "unknown option $1" ;; *) name="$1" ;; esac; shift
+  done
+  [ -n "$name" ] || die "usage: hydra remove <name> [--keep-files]"
+  require_profile "$name"
+  local dir; dir=$(profile_dir "$name")
+
+  if is_default_dir "$dir"; then
+    say "'$name' is your default ~/.claude — forgetting it, leaving the sign-in alone"
+  else
+    if darwin; then security delete-generic-password -s "$(service_name "$dir")" >/dev/null 2>&1 || true; fi
+    rm -f "$dir/.credentials.json"
+    if [ "$keep" -eq 0 ]; then
+      case "$dir" in
+        "$PROFILES_DIR"/*) rm -rf "$dir"; say "deleted $(contract "$dir")" ;;
+        *) say "left $(contract "$dir") in place (outside $(contract "$PROFILES_DIR"))" ;;
+      esac
+    fi
+  fi
+  rm -f "$CACHE_DIR/$name.json"
+  manifest | jq --arg n "$name" 'del(.profiles[$n])' | save_manifest
+  say "removed '$name'"
+}
+
+cmd_list() {
+  manifest | jq -r '.profiles | to_entries[] | "\(.key)\t\(.value.dir)\t\(.value.email // "")"' |
+    awk -F'\t' '{printf "%-12s %-32s %s\n", $1, $2, $3}'
+}
+
+cmd_link() {
+  local force=0 names=""
+  while [ $# -gt 0 ]; do case "$1" in --force) force=1 ;; *) names="$names $1" ;; esac; shift; done
+  [ -n "$names" ] || names=$(profile_names | tr '\n' ' ')
+  local name
+  for name in $names; do
+    require_profile "$name"
+    say "$name:"
+    link_shared "$(profile_dir "$name")" "$force"
+  done
+}
+
+cmd_status() {
+  local cached=0 force=0
+  while [ $# -gt 0 ]; do case "$1" in --cached) cached=1 ;; --force) force=1 ;; esac; shift; done
+  [ "$(profile_count)" -gt 0 ] || die "no profiles yet — hydra add <name>"
+  if [ "$cached" -eq 0 ]; then
+    if [ "$force" -eq 1 ]; then refresh --force >/dev/null; else refresh --stale >/dev/null; fi
+  fi
+  local threshold; threshold=$(manifest | jq -r '.threshold // 95')
+  printf '%-12s %-30s %5s %5s %6s  %-8s %-6s %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE STATE
+  snapshots | jq -r --argjson now "$(now)" --argjson threshold "$threshold" "$JQ_LIB"'
+    .[] | [
+      .name, (if (.email // "") == "" then "-" else .email end),
+      (.session.pct // "null"), (.weekly.pct // "null"), (.fable.pct // "null"),
+      (if .session.resets then (.session.resets - $now) else "null" end),
+      (if .fetched_at > 0 then ($now - .fetched_at) else "null" end),
+      (if (.signed_in | not) then "not signed in on this machine"
+       elif .locked then "locked"
+       elif ([.session.pct, .weekly.pct, .fable.pct] | map(. // 0) | max) >= $threshold then "exhausted"
+       elif .auth == "stale" then "token stale — refreshes on next launch"
+       elif .session == null then "no usage data yet"
+       else "ok" end)
+    ] | map(tostring) | join("|")' |
+  while IFS='|' read -r name email s w f resets age state; do
+    printf '%-12s %-30s %5s %5s %6s  %-8s %-6s %s\n' \
+      "$name" "$email" "$(fmt_pct "$s")" "$(fmt_pct "$w")" "$(fmt_pct "$f")" \
+      "$(fmt_in "$resets")" "$(fmt_in "$age")" "$state"
+  done
+}
+
+cmd_pick() {
+  local json=0; [ "${1:-}" = "--json" ] && json=1
+  [ "$(profile_count)" -gt 0 ] || die "no profiles yet — hydra add <name>"
+  ensure_usage
+  local p; p=$(pick_json) || true
+  [ -n "$p" ] || die "no signed-in profile on this machine"
+  if [ "$json" -eq 1 ]; then printf '%s\n' "$p"; else printf '%s\n' "$p" | jq -r .name; fi
+}
+
+# First launch after sign-in: fetch synchronously for any signed-in profile
+# with no data at all, so the pick is never blind.
+ensure_usage() {
+  local missing
+  missing=$(snapshots | jq -r '.[] | select(.signed_in and .fetched_at == 0) | .name')
+  [ -n "$missing" ] && refresh --force $missing >/dev/null 2>&1 || true
+}
+
+# Kicks off a refresh of stale profiles without holding up the launch.
+background_refresh() {
+  local stale
+  stale=$(snapshots | jq -r --argjson now "$(now)" --argjson min "$MIN_REFRESH_S" \
+    '.[] | select(.signed_in and ($now - .fetched_at) >= $min) | .name' | tr '\n' ' ')
+  [ -n "${stale// /}" ] || return 0
+  ( "$0" refresh --force $stale >/dev/null 2>&1 & ) >/dev/null 2>&1
+}
+
+cmd_exec() {
+  # An explicit CLAUDE_CONFIG_DIR is the caller's decision; don't second-guess it.
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ "$(profile_count)" -eq 0 ]; then exec command claude "$@"; fi
+
+  local name=""
+  if [ $# -gt 0 ]; then
+    if has_profile "$1"; then name="$1"; shift
+    else
+      case " $PASSTHROUGH " in *" $1 "*) exec command claude "$@" ;; esac
+      case "$1" in --version|-v|--help|-h) exec command claude "$@" ;; esac
+    fi
+  fi
+
+  if [ -z "$name" ]; then
+    ensure_usage
+    local p; p=$(pick_json) || true
+    if [ -z "$p" ]; then
+      hint "hydra: no signed-in profile on this machine — launching with default config"
+      exec command claude "$@"
+    fi
+    name=$(printf '%s' "$p" | jq -r .name)
+    hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%   Fable \(.f // "-")%\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
+  fi
+
+  background_refresh
+  local dir; dir=$(profile_dir "$name")
+  if is_default_dir "$dir"; then exec command claude "$@"
+  else export CLAUDE_CONFIG_DIR="$dir"; exec command claude "$@"; fi
+}
+
+cmd_help() {
+  cat <<'EOF'
+hydra — many heads, one Claude Code
+
+  hydra add <name> [--existing | --dir PATH] [--no-login]
+                              new profile (--existing registers ~/.claude itself)
+  hydra login <name>          sign in / re-authenticate a profile
+  hydra remove <name> [--keep-files]
+  hydra list                  profiles and their config dirs
+  hydra status [--cached|--force]
+                              usage per profile (refreshes anything older than 3 min)
+  hydra refresh [names…] [--force]
+  hydra pick [--json]         which profile a bare `claude` would use right now
+  hydra link [names…] [--force]
+                              (re)apply the shared-config symlinks
+  hydra dir <name>            print a profile's config dir
+  hydra has <name>            exit 0 if the profile exists
+  hydra exec [profile] [claude args…]
+                              what the `claude` shell function calls
+
+Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_QUIET=1 (no routing hint)
+EOF
+}
+
+case "${1:-help}" in
+  add)     shift; cmd_add "$@" ;;
+  login)   shift; cmd_login "$@" ;;
+  remove|rm) shift; cmd_remove "$@" ;;
+  list|ls) cmd_list ;;
+  link)    shift; cmd_link "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  refresh) shift; refresh "$@" ;;
+  pick)    shift; cmd_pick "$@" ;;
+  dir)     require_profile "${2:-}"; profile_dir "$2"; echo ;;
+  has)     has_profile "${2:-}" ;;
+  exec)    shift; cmd_exec "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) die "unknown command '$1' (hydra help)" ;;
+esac
