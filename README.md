@@ -50,6 +50,7 @@ hydra status
 | `hydra add <name> [--existing \| --dir PATH] [--no-login]` | new profile; `--existing` registers `~/.claude` itself |
 | `hydra login <name>` | sign in, or sign in again when a token has expired |
 | `hydra remove <name> [--keep-files]` | delete the profile, its Keychain entry and its directory |
+| `hydra rename <old> <new>` | relabel a profile; its sign-in is untouched |
 | `hydra list` | profiles and their config dirs |
 | `hydra status [--cached\|--force]` | usage table; refreshes anything older than 3 minutes |
 | `hydra refresh [names…] [--force]` | fetch usage now |
@@ -57,6 +58,10 @@ hydra status
 | `hydra link [names…] [--force]` | (re)apply the shared-config symlinks |
 | `hydra dir <name>` · `hydra has <name>` | plumbing for scripts |
 | `hydra exec [profile] [claude args…]` | what the `claude` shell function calls |
+| `hydra <profile> [claude args…]` | shorthand for `hydra exec <profile> …` |
+
+Tab completion (zsh and bash) comes with `hydra.sh`: `hydra <Tab>` offers
+commands and profiles, `hydra login <Tab>` and `claude <Tab>` offer profiles.
 
 `HYDRA_QUIET=1` suppresses the one-line routing hint. `HYDRA_HOME` (default
 `~/.hydra`) and `HYDRA_MANIFEST` (default `$HYDRA_HOME/profiles.json`) move the

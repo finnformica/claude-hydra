@@ -31,7 +31,8 @@ SHARED_FILES="settings.json CLAUDE.md history.jsonl"
 
 # Claude's own subcommands: never routed unless a profile is named first.
 PASSTHROUGH="agents attach auth auto-mode doctor gateway import install logs mcp plugin plugins project respawn rm setup-token stop kill ultrareview update upgrade"
-RESERVED="auto best exec $PASSTHROUGH"
+HYDRA_CMDS="add login remove rm rename list ls names link status refresh pick dir has exec help"
+RESERVED="auto best $HYDRA_CMDS $PASSTHROUGH"
 
 # ---------------------------------------------------------------- utilities
 
@@ -361,9 +362,21 @@ cmd_remove() {
   say "removed '$name'"
 }
 
+cmd_rename() {
+  local old="${1:-}" new="${2:-}"
+  [ -n "$old" ] && [ -n "$new" ] || die "usage: hydra rename <old> <new>"
+  require_profile "$old"
+  valid_name "$new" || die "'$new' is not a usable name (lowercase letters, digits, - and _; not a subcommand)"
+  has_profile "$new" && die "profile '$new' already exists"
+  # The config dir (and so the Keychain item) stays put; only the label changes.
+  manifest | jq --arg o "$old" --arg n "$new" '.profiles[$n] = .profiles[$o] | del(.profiles[$o])' | save_manifest
+  [ -f "$CACHE_DIR/$old.json" ] && mv "$CACHE_DIR/$old.json" "$CACHE_DIR/$new.json"
+  say "renamed '$old' → '$new'"
+}
+
 cmd_list() {
   manifest | jq -r '.profiles | to_entries[] | "\(.key)\t\(.value.dir)\t\(.value.email // "")"' |
-    awk -F'\t' '{printf "%-12s %-32s %s\n", $1, $2, $3}'
+    awk -F'\t' '{printf "%-16s %-32s %s\n", $1, $2, $3}'
 }
 
 cmd_link() {
@@ -386,7 +399,7 @@ cmd_status() {
     if [ "$force" -eq 1 ]; then refresh --force >/dev/null; else refresh --stale >/dev/null; fi
   fi
   local threshold; threshold=$(manifest | jq -r '.threshold // 95')
-  printf '%-12s %-30s %5s %5s %6s  %-8s %-6s %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE STATE
+  printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE STATE
   snapshots | jq -r --argjson now "$(now)" --argjson threshold "$threshold" "$JQ_LIB"'
     .[] | [
       .name, (if (.email // "") == "" then "-" else .email end),
@@ -401,7 +414,7 @@ cmd_status() {
        else "ok" end)
     ] | map(tostring) | join("|")' |
   while IFS='|' read -r name email s w f resets age state; do
-    printf '%-12s %-30s %5s %5s %6s  %-8s %-6s %s\n' \
+    printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %s\n' \
       "$name" "$email" "$(fmt_pct "$s")" "$(fmt_pct "$w")" "$(fmt_pct "$f")" \
       "$(fmt_in "$resets")" "$(fmt_in "$age")" "$state"
   done
@@ -471,6 +484,7 @@ hydra — many heads, one Claude Code
                               new profile (--existing registers ~/.claude itself)
   hydra login <name>          sign in / re-authenticate a profile
   hydra remove <name> [--keep-files]
+  hydra rename <old> <new>    relabel a profile (its sign-in is untouched)
   hydra list                  profiles and their config dirs
   hydra status [--cached|--force]
                               usage per profile (refreshes anything older than 3 min)
@@ -482,6 +496,8 @@ hydra — many heads, one Claude Code
   hydra has <name>            exit 0 if the profile exists
   hydra exec [profile] [claude args…]
                               what the `claude` shell function calls
+  hydra <profile> [claude args…]
+                              shorthand for hydra exec <profile> …
 
 Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_QUIET=1 (no routing hint)
 EOF
@@ -491,7 +507,9 @@ case "${1:-help}" in
   add)     shift; cmd_add "$@" ;;
   login)   shift; cmd_login "$@" ;;
   remove|rm) shift; cmd_remove "$@" ;;
+  rename)  shift; cmd_rename "$@" ;;
   list|ls) cmd_list ;;
+  names)   profile_names ;;
   link)    shift; cmd_link "$@" ;;
   status)  shift; cmd_status "$@" ;;
   refresh) shift; refresh "$@" ;;
@@ -500,5 +518,5 @@ case "${1:-help}" in
   has)     has_profile "${2:-}" ;;
   exec)    shift; cmd_exec "$@" ;;
   help|-h|--help) cmd_help ;;
-  *) die "unknown command '$1' (hydra help)" ;;
+  *) if has_profile "$1"; then cmd_exec "$@"; else die "unknown command '$1' (hydra help)"; fi ;;
 esac
