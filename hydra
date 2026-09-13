@@ -55,7 +55,11 @@ sha8() {
 expand() { case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s%s' "$HOME" "${1#"~"}" ;; *) printf '%s' "$1" ;; esac; }
 contract() { case "$1" in "$HOME") printf '~' ;; "$HOME/"*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
 
-now() { date +%s; }
+now() { printf '%s' "${HYDRA_NOW:-$(date +%s)}"; }   # HYDRA_NOW: fixed clock for tests
+
+# The Keychain is used on macOS unless HYDRA_NO_KEYCHAIN is set (tests, or a
+# Claude Code install that writes .credentials.json instead).
+use_keychain() { darwin && [ -z "${HYDRA_NO_KEYCHAIN:-}" ]; }
 
 # ---------------------------------------------------------------- manifest
 
@@ -100,7 +104,7 @@ service_name() {
 # Prints the credential blob for a config dir; fails when not signed in.
 credentials() {
   local dir="$1"
-  if darwin; then
+  if use_keychain; then
     security find-generic-password -s "$(service_name "$dir")" -w 2>/dev/null && return 0
   fi
   [ -f "$dir/.credentials.json" ] && cat "$dir/.credentials.json"
@@ -382,7 +386,7 @@ cmd_remove() {
   if is_default_dir "$dir"; then
     say "'$name' is your default ~/.claude — forgetting it, leaving the sign-in alone"
   else
-    if darwin; then security delete-generic-password -s "$(service_name "$dir")" >/dev/null 2>&1 || true; fi
+    if use_keychain; then security delete-generic-password -s "$(service_name "$dir")" >/dev/null 2>&1 || true; fi
     rm -f "$dir/.credentials.json"
     if [ "$keep" -eq 0 ]; then
       case "$dir" in

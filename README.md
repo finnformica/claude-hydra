@@ -163,6 +163,19 @@ for any profile that laptop hasn't logged into yet.
 - Claude Code writes settings atomically; if an update ever replaces the
   `settings.json` symlink with a real file, `hydra link --force` restores it.
 
+## Tests
+
+```sh
+test/run.sh          # everything
+test/run.sh pick     # only tests whose name contains "pick"
+```
+
+No dependencies beyond bash, jq and coreutils. Each test runs in a throwaway
+sandbox — its own `$HOME`, a fake `claude` and `curl` on `PATH`, a fixed clock
+(`HYDRA_NOW`) and file-based credentials (`HYDRA_NO_KEYCHAIN=1`) — so nothing
+touches your real profiles, Keychain or the network. CI runs the suite on
+macOS and Ubuntu.
+
 ## Credits
 
 The Keychain naming and endpoint behaviour were confirmed against
