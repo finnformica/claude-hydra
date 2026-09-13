@@ -457,7 +457,7 @@ fi
 
 if test "the claude() shell function wraps the binary"; then
   add w; set_usage w 0 0 0
-  out=$(bash -c "source '$ROOT/hydra.sh'; claude -p hi")
+  out=$(PATH="$ROOT:$PATH" bash -c "source '$ROOT/hydra.sh'; claude -p hi")
   assert_contains "routed via the function" "dir=$HYDRA_HOME/profiles/w" "$out"
   out=$(PATH="$SB/bin:/usr/bin:/bin" bash -c "source '$ROOT/hydra.sh'; claude -p hi")
   assert_contains "without hydra on PATH it falls back to the binary" "dir=<unset>" "$out"
