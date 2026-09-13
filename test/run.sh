@@ -191,6 +191,23 @@ if test "link repairs drift"; then
   assert_eq "…and keeps the old copy" '{"model":"x"}' "$(cat "$d/settings.json.hydra-bak")"
 fi
 
+if test "a new profile skips Claude's first-run wizard"; then
+  printf '{"hasCompletedOnboarding":true,"lastOnboardingVersion":"2.0","theme":"dark","numStartups":9,"oauthAccount":{"emailAddress":"me@example.com"}}' >"$HOME/.claude.json"
+  add w
+  cfg="$HYDRA_HOME/profiles/w/.claude.json"
+  assert_eq "onboarding marker copied" "true" "$(jq .hasCompletedOnboarding "$cfg")"
+  assert_eq "theme copied" "dark" "$(jq -r .theme "$cfg")"
+  assert_eq "unrelated keys are not copied" "null" "$(jq .numStartups "$cfg")"
+  assert_eq "the profile's own account is kept" "w@example.com" "$(jq -r .oauthAccount.emailAddress "$cfg")"
+  jq '.theme = "light"' "$cfg" >"$SB/c" && mv "$SB/c" "$cfg"
+  "$HYDRA" link w >/dev/null 2>&1
+  assert_eq "link seeds but never overwrites" "light" "$(jq -r .theme "$cfg")"
+  add old "" --no-login; rm -f "$HYDRA_HOME/profiles/old/.claude.json"
+  "$HYDRA" link old >/dev/null 2>&1
+  assert_eq "link seeds a profile with no state file at all" "true" "$(jq .hasCompletedOnboarding "$HYDRA_HOME/profiles/old/.claude.json")"
+  assert_eq "default profile untouched" "9" "$(jq .numStartups "$HOME/.claude.json")"
+fi
+
 if test "enable/disable"; then
   add a; add b; set_usage a 50 0 0; set_usage b 10 0 0
   assert_eq "b is freshest" b "$(pick)"

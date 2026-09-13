@@ -303,6 +303,25 @@ fmt_in() { # seconds → "2h13m" / "3d"
 
 # ---------------------------------------------------------------- linking
 
+# A brand-new config dir makes Claude Code run its first-run wizard (theme,
+# sign-in) even though the profile is already signed in. Copying the
+# onboarding markers from ~/.claude.json skips it. Never overwrites a value
+# the profile already has, never touches the default profile.
+SEED_KEYS='["hasCompletedOnboarding","lastOnboardingVersion","theme","shiftEnterKeyBindingInstalled","hasIdeOnboardingBeenShown","preferredNotifChannel","editorMode","hasSeenTasksHint"]'
+seed_state() {
+  local dir="$1" src="$HOME/.claude.json" dst tmp
+  is_default_dir "$dir" && return 0
+  [ -f "$src" ] || return 0
+  dst=$(claude_json "$dir"); tmp="$dst.hydra.$$"
+  mkdir -p "$dir"
+  [ -f "$dst" ] || printf '{}' >"$dst"
+  jq -s --argjson keys "$SEED_KEYS" '
+    .[0] as $src | .[1] as $dst
+    | $dst + ($src
+        | with_entries(select((.key as $k | $keys | index($k)) != null and .value != null))
+        | with_entries(select(.key as $k | $dst[$k] == null)))' "$src" "$dst" >"$tmp"     && mv "$tmp" "$dst" && chmod 600 "$dst"
+}
+
 # Symlinks the shared parts of ~/.claude into a profile dir. Idempotent.
 link_shared() {
   local dir="$1" force="${2:-0}" item src dst
@@ -350,6 +369,7 @@ cmd_add() {
   manifest | jq --arg n "$name" --arg d "$(contract "$dir")" '.profiles[$n] = {dir: $d}' | save_manifest
   say "added '$name' → $(contract "$dir")"
   link_shared "$dir"
+  seed_state "$dir"
 
   if [ "$login" -eq 1 ] && ! signed_in "$dir"; then cmd_login "$name"
   else record_email "$name"; fi
@@ -367,6 +387,7 @@ cmd_login() {
   require_profile "$name"
   local dir; dir=$(profile_dir "$name")
   link_shared "$dir"
+  seed_state "$dir"
   say "signing in '$name'…"
   run_claude "$dir" auth login
   record_email "$name"
@@ -440,6 +461,7 @@ cmd_link() {
     require_profile "$name"
     say "$name:"
     link_shared "$(profile_dir "$name")" "$force"
+    seed_state "$(profile_dir "$name")"
   done
 }
 
