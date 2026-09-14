@@ -928,6 +928,31 @@ if test "status: --json state agrees with the table, row for row"; then
   assert_eq "missing windows are null, not errors" "null null null" "$(printf '%s' "$json" | jq -r '.profiles[] | select(.name == "d") | "\(.session) \(.weekly) \(.fable)"')"
 fi
 
+if test "status: a disabled profile's usage is still refreshed and reported"; then
+  add a; add b; set_usage a 12 12 22; set_usage b 1 0 0
+  "$HYDRA" disable b >/dev/null 2>&1
+  usage 40 50 60 >"$FAKE_CURL_BODY"; : >"$FAKE_LOG"
+  later=$((NOW + 600))
+  HYDRA_NOW=$later "$HYDRA" status --json >"$SB/status.json"
+  assert_ok "parses" jq -e . "$SB/status.json"
+  assert_eq "both stale rows were fetched" "2" "$(curl_calls)"
+  assert_eq "b's windows are current" "[40,50,60]" "$(jq -c '.profiles[] | select(.name == "b") | [.session.pct, .weekly.pct, .fable.pct]' "$SB/status.json")"
+  assert_eq "b's fetched_at is now" "$later" "$(jq '.profiles[] | select(.name == "b") | .fetched_at' "$SB/status.json")"
+  assert_eq "b still reads disabled" "true disabled" "$(jq -r '.profiles[] | select(.name == "b") | "\(.disabled) \(.state)"' "$SB/status.json")"
+  : >"$FAKE_LOG"
+  HYDRA_NOW=$later "$HYDRA" status --json >/dev/null
+  assert_eq "fresh rows are not re-fetched, disabled or not" "0" "$(curl_calls)"
+  HYDRA_NOW=$later "$HYDRA" status --json --force >/dev/null
+  assert_eq "--force fetches every row" "2" "$(curl_calls)"
+  rm -f "$HYDRA_HOME/cache/b.json"; : >"$FAKE_LOG"
+  HYDRA_NOW=$later "$HYDRA" status --json --cached >"$SB/status.json"
+  assert_eq "--cached makes no request" "0" "$(curl_calls)"
+  assert_eq "…and reports the missing windows as null" "null null null" "$(jq -r '.profiles[] | select(.name == "b") | "\(.session) \(.weekly) \(.fable)"' "$SB/status.json")"
+  HYDRA_NOW=$later "$HYDRA" status --json >"$SB/status.json"
+  assert_eq "disabled before any fetch: the first status fills it in" "[40,50,60]" "$(jq -c '.profiles[] | select(.name == "b") | [.session.pct, .weekly.pct, .fable.pct]' "$SB/status.json")"
+  assert_contains "the table row carries the same numbers" "40%   50%    60%" "$(HYDRA_NOW=$later "$HYDRA" status --cached | grep '^b ')"
+fi
+
 if test "status: --json puts nothing but the document on stdout"; then
   assert_fails "no profiles: dies like the table does" "$HYDRA" status --json --cached
   add a; set_usage a 1 2 3
