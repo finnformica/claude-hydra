@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# hydra-shim — stands in for the `claude` binary on PATH.
+#
+# install.sh --shim links ~/.local/bin/claude here so that every launcher —
+# an interactive shell, an editor, a script running `claude -p` — goes through
+# hydra's routing, not just the claude() shell function. hydra recognises this
+# file by the "hydra-shim" marker in its header and never execs it as the
+# real binary; it execs the real one by explicit path (hydra bin).
+set -eu
+
+# hydra execs the real claude with HYDRA_LAUNCH_PID set to its own pid, which
+# exec preserves. Landing back here with the same pid means the "real" binary
+# hydra resolved was this shim — stop instead of looping forever.
+if [ "${HYDRA_LAUNCH_PID:-}" = "$$" ]; then
+  printf 'hydra: the claude shim was launched recursively — claude_bin resolves to the shim itself (hydra bin PATH, or install.sh --unshim)\n' >&2
+  exit 70
+fi
+
+# Prefer the hydra beside this file (following the install symlink), so the
+# shim works even when ~/.local/bin is not on PATH yet.
+self=$0
+while [ -L "$self" ]; do
+  t=$(readlink "$self")
+  case "$t" in /*) self=$t ;; *) self="$(dirname "$self")/$t" ;; esac
+done
+hydra="$(cd "$(dirname "$self")" && pwd)/hydra"
+[ -x "$hydra" ] || hydra=hydra
+
+exec "$hydra" exec "$@"

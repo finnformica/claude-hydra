@@ -7,7 +7,7 @@
 #
 #   hydra add work           create a profile and sign it in
 #   hydra status             usage per profile
-#   claude                   launch on the freshest profile (via hydra.sh)
+#   claude                   launch on the freshest profile (via hydra.sh or the shim)
 #   claude work --resume     launch on a named profile
 #
 # State lives in $HYDRA_HOME (default ~/.hydra); nothing secret is written
@@ -31,14 +31,25 @@ SHARED_FILES="settings.json CLAUDE.md history.jsonl"
 
 # Claude's own subcommands: never routed unless a profile is named first.
 PASSTHROUGH="agents attach auth auto-mode doctor gateway import install logs mcp plugin plugins project respawn rm setup-token stop kill ultrareview update upgrade"
-HYDRA_CMDS="add login remove rm rename enable disable list ls names link status refresh pick dir has exec help"
+HYDRA_CMDS="add login remove rm rename enable disable list ls names link status refresh pick dir has exec bin help"
 RESERVED="auto best $HYDRA_CMDS $PASSTHROUGH"
 
 # ---------------------------------------------------------------- utilities
 
 die() { printf 'hydra: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*" >&2; }
-hint() { [ -n "${HYDRA_QUIET:-}" ] || printf '%s\n' "$*" >&2; }
+
+# The routing hint goes to stderr only when stderr is a terminal: a headless
+# caller (`claude -p` from a script) captures stderr for error text and must
+# not see it. HYDRA_QUIET=1 always suppresses it, HYDRA_QUIET=0 always prints it.
+hint() {
+  case "${HYDRA_QUIET:-}" in
+    0) ;;
+    "") [ -t 2 ] || return 0 ;;
+    *) return 0 ;;
+  esac
+  printf '%s\n' "$*" >&2
+}
 need() { command -v "$1" >/dev/null 2>&1 || die "needs $1 on PATH"; }
 
 need jq
@@ -119,9 +130,69 @@ account_email() { jq -r '.oauthAccount.emailAddress // empty' "$(claude_json "$1
 
 # Runs the real claude binary inside a profile's config dir.
 run_claude() {
-  local dir="$1"; shift
-  if is_default_dir "$dir"; then command claude "$@"
-  else CLAUDE_CONFIG_DIR="$dir" command claude "$@"; fi
+  local dir="$1" bin; shift
+  bin=$(claude_bin)
+  if is_default_dir "$dir"; then "$bin" "$@"
+  else CLAUDE_CONFIG_DIR="$dir" "$bin" "$@"; fi
+}
+
+# ---------------------------------------------------------------- the real claude
+
+# hydra never runs claude by name: with install.sh --shim, the `claude` on PATH
+# *is* hydra, so exec'ing the name would recurse. The real binary comes from
+# HYDRA_CLAUDE_BIN, else claude_bin in the manifest, else the first claude on
+# PATH that is not hydra's shim — always resolved through its symlinks so the
+# recorded path stays valid once the shim takes over the original one.
+
+# Follows symlinks without readlink -f (absent on older macOS).
+real_path() {
+  local p="$1" t
+  while [ -L "$p" ]; do
+    t=$(readlink "$p")
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+  done
+  printf '%s/%s' "$(cd "$(dirname "$p")" && pwd -P)" "$(basename "$p")"
+}
+
+# The shim announces itself with a marker in its header; hydra itself counts too.
+is_shim() { [ "$1" -ef "$0" ] || { head -c 512 "$1" 2>/dev/null || true; } | grep -q 'hydra-shim'; }   # || true: pipefail must not turn a SIGPIPE into "not a shim"
+
+# Prints the resolved path of a candidate if it is a runnable, non-shim claude.
+usable_bin() { [ -n "$1" ] && [ -f "$1" ] && [ -x "$1" ] && ! is_shim "$1" && real_path "$1"; }
+
+find_claude_bin() {
+  local IFS=: d c
+  for d in $PATH; do
+    c="${d:-.}/claude"
+    usable_bin "$c" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+CLAUDE_BIN=""
+claude_bin() {
+  if [ -z "$CLAUDE_BIN" ]; then
+    local b
+    if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then
+      b=$(usable_bin "$(expand "$HYDRA_CLAUDE_BIN")") ||
+        die "HYDRA_CLAUDE_BIN=$HYDRA_CLAUDE_BIN is not a runnable claude (missing, not executable, or hydra's own shim)"
+    else
+      # A manifest entry that no longer runs here (another machine, a pruned
+      # version) falls back to PATH rather than blocking every launch.
+      b=$(usable_bin "$(expand "$(manifest | jq -r '.claude_bin // empty')")" 2>/dev/null) ||
+        b=$(find_claude_bin) ||
+        die "no claude binary on PATH apart from hydra's own shim — hydra bin PATH, HYDRA_CLAUDE_BIN, or install.sh --unshim"
+    fi
+    CLAUDE_BIN="$b"
+  fi
+  printf '%s' "$CLAUDE_BIN"
+}
+
+# Replaces this process with the real claude, argv[0] "claude" as before.
+launch() {
+  local bin; bin=$(claude_bin)
+  HYDRA_LAUNCH_PID=$$; export HYDRA_LAUNCH_PID   # the shim's recursion tripwire
+  exec -a claude "$bin" "$@"
 }
 
 # ---------------------------------------------------------------- model intent
@@ -153,7 +224,7 @@ model_label() { case "$1" in *fable*) printf 'fable' ;; *opus*) printf 'opus' ;;
 
 # ---------------------------------------------------------------- usage
 
-claude_version() { command claude --version 2>/dev/null | awk '{print $1}'; }
+claude_version() { local b; b=$(claude_bin 2>/dev/null) || return 0; "$b" --version 2>/dev/null | awk '{print $1}'; }
 
 # Fetches /api/oauth/usage for one profile into the cache. Prints a status word.
 fetch_usage() {
@@ -527,14 +598,14 @@ background_refresh() {
 
 cmd_exec() {
   # An explicit CLAUDE_CONFIG_DIR is the caller's decision; don't second-guess it.
-  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ "$(profile_count)" -eq 0 ]; then exec claude "$@"; fi
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ "$(profile_count)" -eq 0 ]; then launch "$@"; fi
 
   local name=""
   if [ $# -gt 0 ]; then
     if has_profile "$1"; then name="$1"; shift
     else
-      case " $PASSTHROUGH " in *" $1 "*) exec claude "$@" ;; esac
-      case "$1" in --version|-v|--help|-h) exec claude "$@" ;; esac
+      case " $PASSTHROUGH " in *" $1 "*) launch "$@" ;; esac
+      case "$1" in --version|-v|--help|-h) launch "$@" ;; esac
     fi
   fi
 
@@ -543,7 +614,7 @@ cmd_exec() {
     local p; p=$(pick_json "$(model_from_args "$@")") || true
     if [ -z "$p" ]; then
       hint "hydra: no signed-in profile on this machine — launching with default config"
-      exec claude "$@"
+      launch "$@"
     fi
     name=$(printf '%s' "$p" | jq -r .name)
     hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%\(if .intent == "fable" then "   Fable \(.f // "-")%" else "   (\(.intent): Fable window ignored)" end)\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
@@ -551,8 +622,28 @@ cmd_exec() {
 
   background_refresh
   local dir; dir=$(profile_dir "$name")
-  if is_default_dir "$dir"; then exec claude "$@"
-  else export CLAUDE_CONFIG_DIR="$dir"; exec claude "$@"; fi
+  if is_default_dir "$dir"; then launch "$@"
+  else export CLAUDE_CONFIG_DIR="$dir"; launch "$@"; fi
+}
+
+# hydra bin            the real claude hydra execs (resolved)
+# hydra bin PATH       record it in the manifest (install.sh --shim does this)
+# hydra bin --unset    forget it; PATH is walked again
+cmd_bin() {
+  case "${1:-}" in
+    "") claude_bin; echo ;;
+    --unset)
+      if manifest | jq -e '.claude_bin != null' >/dev/null 2>&1; then
+        manifest | jq 'del(.claude_bin)' | save_manifest
+      fi
+      say "claude_bin cleared — hydra runs the first claude on PATH that is not its shim" ;;
+    -*) die "usage: hydra bin [PATH | --unset]" ;;
+    *)
+      local real
+      real=$(usable_bin "$(expand "$1")") || die "'$1' is not a runnable claude (missing, not executable, or hydra's own shim)"
+      manifest | jq --arg b "$(contract "$real")" '.claude_bin = $b' | save_manifest
+      say "claude_bin → $(contract "$real")" ;;
+  esac
 }
 
 cmd_help() {
@@ -577,12 +668,14 @@ hydra — many heads, one Claude Code
   hydra dir <name>            print a profile's config dir
   hydra has <name>            exit 0 if the profile exists
   hydra exec [profile] [claude args…]
-                              what the `claude` shell function calls
+                              what the `claude` shell function and the shim call
   hydra <profile> [claude args…]
                               shorthand for hydra exec <profile> …
+  hydra bin [PATH | --unset]  the real claude binary hydra execs; set or forget it
 
-Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_QUIET=1 (no routing hint),
-             HYDRA_MODEL (score for this model when no --model is passed)
+Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_CLAUDE_BIN (the real binary),
+             HYDRA_QUIET=1 (never print the routing hint; default: only on a terminal;
+             HYDRA_QUIET=0 always), HYDRA_MODEL (score for this model when no --model is passed)
 EOF
 }
 
@@ -602,6 +695,7 @@ case "${1:-help}" in
   dir)     require_profile "${2:-}"; profile_dir "$2"; echo ;;
   has)     has_profile "${2:-}" ;;
   exec)    shift; cmd_exec "$@" ;;
+  bin)     shift; cmd_bin "$@" ;;
   help|-h|--help) cmd_help ;;
   *) if has_profile "$1"; then cmd_exec "$@"; else die "unknown command '$1' (hydra help)"; fi ;;
 esac

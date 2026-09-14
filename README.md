@@ -22,6 +22,8 @@ work         you@work.example                 12%   30%     8%  4h50m    2m     
 ```
 
 Your shell command stays `claude`, with every argument passed through untouched.
+Optionally, hydra can also stand in for the `claude` *binary* on PATH, so that
+editors and scripts running `claude -p` are routed too (see the shim below).
 
 ## Install
 
@@ -43,6 +45,31 @@ hydra add work                   # creates a profile and opens the sign-in flow
 hydra status
 ```
 
+### Routing every launcher: the shim
+
+The install above defines a `claude` shell *function*, so only launches typed
+into your shell are routed. Anything that spawns the `claude` binary directly —
+an editor integration, a script running `claude -p …`, another tool — lands on
+the default profile. To route those as well, put hydra's shim in place of the
+binary:
+
+```sh
+~/.local/share/claude-hydra/install.sh --shim
+```
+
+This records where the real binary is (`hydra bin`), moves whatever was at
+`~/.local/bin/claude` aside as `claude.hydra-bak` — on a native macOS install
+that is the symlink to the versioned binary — and links `~/.local/bin/claude`
+to the shim, which runs `hydra exec "$@"`. It prints exactly what it replaced,
+refuses to install if it cannot find a real binary (or the only one it finds
+is itself), and is idempotent. `install.sh --unshim` puts the original back.
+
+hydra never runs `claude` by name once the shim is in — it execs the recorded
+binary by path — so nothing recurses. An explicit `CLAUDE_CONFIG_DIR` in the
+environment still bypasses routing entirely; that is how a caller pins a
+profile. Headless callers get a clean stderr: the routing hint is only
+printed when stderr is a terminal.
+
 ## Commands
 
 | | |
@@ -58,14 +85,18 @@ hydra status
 | `hydra pick [--json] [--model M]` | which profile a bare `claude` (or `claude --model M`) would use right now |
 | `hydra link [names…] [--force]` | (re)apply the shared-config symlinks |
 | `hydra dir <name>` · `hydra has <name>` | plumbing for scripts |
-| `hydra exec [profile] [claude args…]` | what the `claude` shell function calls |
+| `hydra exec [profile] [claude args…]` | what the `claude` shell function and the shim call |
 | `hydra <profile> [claude args…]` | shorthand for `hydra exec <profile> …` |
+| `hydra bin [PATH \| --unset]` | the real `claude` binary hydra execs; record one, or forget it and search PATH again |
 
 Tab completion (zsh and bash) comes with `hydra.sh`: `hydra <Tab>` offers
 commands and profiles, `hydra login <Tab>` and `claude <Tab>` offer profiles.
 
-`HYDRA_QUIET=1` suppresses the one-line routing hint. `HYDRA_MODEL=opus`
-scores launches for that model when no `--model` is passed. `HYDRA_HOME` (default
+The one-line routing hint is printed only when stderr is a terminal, so a
+script capturing stderr never sees it; `HYDRA_QUIET=1` always suppresses it and
+`HYDRA_QUIET=0` always prints it. `HYDRA_MODEL=opus` scores launches for that
+model when no `--model` is passed. `HYDRA_CLAUDE_BIN` names the real binary for
+one invocation (it beats `claude_bin` in the manifest). `HYDRA_HOME` (default
 `~/.hydra`) and `HYDRA_MANIFEST` (default `$HYDRA_HOME/profiles.json`) move the
 state.
 
@@ -99,12 +130,17 @@ Threshold, weights, grace and default model live in `profiles.json`:
   "weights": { "session": 1, "fable": 1, "weekly": 1 },
   "reset_grace_minutes": 10,
   "default_model": "fable",
+  "claude_bin": "~/.local/share/claude/versions/2.1.0",
   "profiles": {
     "personal": { "dir": "~/.claude", "email": "you@example.com" },
     "work":     { "dir": "~/.hydra/profiles/work", "email": "you@work.example", "disabled": true }
   }
 }
 ```
+
+`claude_bin` is written by `install.sh --shim` (or `hydra bin PATH`) and is the
+one machine-specific entry: on a machine where it does not run, hydra falls
+back to the first `claude` on PATH that is not its own shim.
 
 A disabled profile stays signed in and shows in `hydra status`, but is never
 auto-picked; `claude work` still launches it explicitly.
@@ -145,6 +181,11 @@ for any profile that laptop hasn't logged into yet.
   and starts immediately; stale caches are refreshed in a detached background
   process for the next launch. Polling is floored at 180 s because the
   endpoint rate-limits anything faster.
+- **The real binary is always exec'd by path**, never by the name `claude`:
+  `HYDRA_CLAUDE_BIN`, else `claude_bin` in the manifest, else the first
+  `claude` on PATH that is not the shim (the shim carries a marker in its
+  header). If the shim ever finds itself launched by hydra it stops with an
+  error instead of looping.
 
 ## Limitations
 
@@ -162,6 +203,10 @@ for any profile that laptop hasn't logged into yet.
   or use project scope.
 - Claude Code writes settings atomically; if an update ever replaces the
   `settings.json` symlink with a real file, `hydra link --force` restores it.
+- Claude Code's own updater rewrites `~/.local/bin/claude` on a native install,
+  which removes the shim and leaves `claude_bin` pointing at the previous
+  version. Run `install.sh --shim` again after an update; it re-resolves the
+  binary and relinks.
 
 ## Tests
 

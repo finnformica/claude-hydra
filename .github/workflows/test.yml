@@ -8,5 +8,5 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: bash -n hydra install.sh hydra.sh test/run.sh
+      - run: bash -n hydra claude-shim install.sh hydra.sh test/run.sh
       - run: test/run.sh
