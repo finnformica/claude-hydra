@@ -206,6 +206,16 @@ JQ_LIB='
   def eff(b; grace): if b == null then null
                      elif (b.resets != null and b.resets <= $now + grace) then 0
                      else b.pct end;
+  # Why a profile is (or is not) usable, first reason wins. The status table and
+  # `status --json` both read it from here so the two can never disagree.
+  def state($threshold):
+    if (.signed_in | not) then "not signed in on this machine"
+    elif .disabled then "disabled"
+    elif .locked then "locked"
+    elif ([.session.pct, .weekly.pct, .fable.pct] | map(. // 0) | max) >= $threshold then "exhausted"
+    elif .auth == "stale" then "token stale — refreshes on next launch"
+    elif .session == null then "no usage data yet"
+    else "ok" end;
 '
 
 # One normalised usage record per profile, from whichever is newer: hydra'"'"'s
@@ -467,13 +477,20 @@ cmd_link() {
 }
 
 cmd_status() {
-  local cached=0 force=0
-  while [ $# -gt 0 ]; do case "$1" in --cached) cached=1 ;; --force) force=1 ;; esac; shift; done
+  local cached=0 force=0 json=0
+  while [ $# -gt 0 ]; do case "$1" in --cached) cached=1 ;; --force) force=1 ;; --json) json=1 ;; esac; shift; done
   [ "$(profile_count)" -gt 0 ] || die "no profiles yet — hydra add <name>"
   if [ "$cached" -eq 0 ]; then
     if [ "$force" -eq 1 ]; then refresh --force >/dev/null; else refresh --stale >/dev/null; fi
   fi
   local threshold; threshold=$(manifest | jq -r '.threshold // 90')
+  if [ "$json" -eq 1 ]; then
+    # The table's rows, verbatim, for tools that poll usage (nothing secret is
+    # in a snapshot). `now` lets callers count down to a reset without clock skew.
+    snapshots | jq --argjson now "$(now)" --argjson threshold "$threshold" "$JQ_LIB"'
+      {threshold: $threshold, now: $now, profiles: map(. + {state: state($threshold)})}'
+    return 0
+  fi
   printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE STATE
   snapshots | jq -r --argjson now "$(now)" --argjson threshold "$threshold" "$JQ_LIB"'
     .[] | [
@@ -481,13 +498,7 @@ cmd_status() {
       (.session.pct // "null"), (.weekly.pct // "null"), (.fable.pct // "null"),
       (if .session.resets then (.session.resets - $now) else "null" end),
       (if .fetched_at > 0 then ($now - .fetched_at) else "null" end),
-      (if (.signed_in | not) then "not signed in on this machine"
-       elif .disabled then "disabled"
-       elif .locked then "locked"
-       elif ([.session.pct, .weekly.pct, .fable.pct] | map(. // 0) | max) >= $threshold then "exhausted"
-       elif .auth == "stale" then "token stale — refreshes on next launch"
-       elif .session == null then "no usage data yet"
-       else "ok" end)
+      state($threshold)
     ] | map(tostring) | join("|")' |
   while IFS='|' read -r name email s w f resets age state; do
     printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %s\n' \
@@ -567,8 +578,9 @@ hydra — many heads, one Claude Code
   hydra disable <name>        keep it signed in but out of the rotation
   hydra enable <name>         put it back
   hydra list                  profiles and their config dirs
-  hydra status [--cached|--force]
-                              usage per profile (refreshes anything older than 3 min)
+  hydra status [--cached|--force] [--json]
+                              usage per profile (refreshes anything older than 3 min);
+                              --json prints the same rows as one JSON document
   hydra refresh [names…] [--force]
   hydra pick [--json] [--model M]
                               which profile a bare `claude` (or `claude --model M`) would use

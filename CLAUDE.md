@@ -95,6 +95,12 @@ if missing so the link always resolves; files are linked only if they exist.
 credentials are never shared. `link_shared` is idempotent and repairs wrong
 targets; it replaces a real file only with `--force` (keeping a `.hydra-bak`).
 
+**The STATE column and `status --json` share one rule.** `state($threshold)` in
+`JQ_LIB` is the only place that decides `ok` / `exhausted` / `locked` / …; the
+table and the JSON both call it, and `--json` is `snapshots` plus that field,
+nothing re-derived. Orca reads the JSON strings verbatim, so changing one means
+changing the test under `# status:` too.
+
 **Reserved names.** A profile name may not collide with a hydra subcommand
 (`HYDRA_CMDS`), a Claude subcommand (`PASSTHROUGH`), or `auto`/`best`, because
 `hydra <name>` and `claude <name>` dispatch on the first argument. Add new
