@@ -251,9 +251,12 @@ if test "enable/disable"; then
   assert_contains "list marks it" "disabled" "$("$HYDRA" list | grep '^b ')"
   assert_contains "status marks it" "disabled" "$("$HYDRA" status --cached | grep '^b ')"
   : >"$FAKE_LOG"; "$HYDRA" refresh --force >/dev/null
-  assert_eq "refresh skips disabled profiles" "1" "$(curl_calls)"
+  assert_eq "bare refresh still fetches disabled profiles" "2" "$(curl_calls)"
   "$HYDRA" refresh --force b >/dev/null
-  assert_eq "…unless named" "2" "$(curl_calls)"
+  assert_eq "…and by name" "3" "$(curl_calls)"
+  jq '.fetched_at = 1' "$HYDRA_HOME/cache/b.json" >"$SB/c" && mv "$SB/c" "$HYDRA_HOME/cache/b.json"
+  : >"$FAKE_LOG"; "$HYDRA" exec x >/dev/null; sleep 0.5
+  assert_eq "a launch does not refresh a profile it cannot pick" "0" "$(curl_calls)"
   out=$("$HYDRA" exec b x)
   assert_contains "claude b still launches it" "dir=$HYDRA_HOME/profiles/b" "$out"
   set_usage a 50 0 0; set_usage b 10 0 0
