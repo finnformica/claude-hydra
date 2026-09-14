@@ -84,9 +84,10 @@ is_default_dir() { [ "$1" = "$DEFAULT_DIR" ]; }
 require_profile() { has_profile "$1" || die "no profile named '$1' (hydra list)"; }
 
 valid_name() {
-  case "$1" in
-    ''|-*|*[!a-z0-9_-]*) return 1 ;;
-  esac
+  case "$1" in ''|-*) return 1 ;; esac
+  # Under LC_ALL=C on purpose: in a UTF-8 locale bash 3.2 collates [a-z] so it
+  # matches capitals too, and `Work` slipped through on macOS (CI caught it).
+  [ -z "$(printf '%s' "$1" | LC_ALL=C tr -d 'a-z0-9_-')" ] || return 1
   case " $RESERVED " in *" $1 "*) return 1 ;; esac
   return 0
 }

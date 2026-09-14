@@ -40,7 +40,9 @@ command immediately (it is symlinked).
 
 **Portability.** The script must run on macOS's stock bash 3.2 and jq 1.6, and
 on Linux. So: no associative arrays, no `${var,,}`, no `mapfile`, no
-`readarray`; no jq features newer than 1.6 (`fromdateiso8601` needs the `ts`
+`readarray`; bracket ranges like `[a-z]` are locale-collated in bash 3.2 (they
+match capitals under `en_US.UTF-8`), so `valid_name` checks its character set
+through `LC_ALL=C tr`; no jq features newer than 1.6 (`fromdateiso8601` needs the `ts`
 helper because it rejects fractional seconds and `+00:00`). `exec claude`, not
 `exec command claude` — bash cannot exec a builtin, and macOS only hid that
 behind its `/usr/bin/command` shim (CI caught it).
