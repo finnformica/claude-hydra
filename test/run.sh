@@ -123,6 +123,7 @@ tool_path() {
 manifest() { cat "$HYDRA_HOME/profiles.json"; }
 pick() { "$HYDRA" pick "$@"; }
 pickj() { local f=$1; shift; "$HYDRA" pick --json "$@" | jq -r "$f"; }
+statusj() { local f=$1; shift; "$HYDRA" status --json "$@" | jq -r "$f"; }
 curl_calls() { local n; n=$(grep -c '^curl' "$FAKE_LOG" 2>/dev/null); printf '%s' "${n:-0}"; }
 
 # ---------------------------------------------------------------- profiles
@@ -666,6 +667,78 @@ if test "status table"; then
   assert_contains "numbers" "7%    2%     3%" "$out"
   assert_contains "signed-out row" "not signed in on this machine" "$out"
   assert_contains "dash for missing numbers" "    -     -      -" "$out"
+fi
+
+# ---------------------------------------------------------------- status --json
+
+if test "status: --json reports every window for every profile"; then
+  add a; add b; set_usage a 12 12 22; set_usage b 1 0 0
+  : >"$FAKE_LOG"
+  "$HYDRA" status --json --cached >"$SB/status.json"
+  assert_ok "parses" jq -e . "$SB/status.json"
+  assert_eq "--cached makes no request" "0" "$(curl_calls)"
+  assert_eq "one entry per profile, in profile_names order" "a b" "$(jq -r '[.profiles[].name] | join(" ")' "$SB/status.json")"
+  assert_eq "a's three windows" "[12,12,22]" "$(jq -c '.profiles[0] | [.session.pct, .weekly.pct, .fable.pct]' "$SB/status.json")"
+  assert_eq "b's three windows" "[1,0,0]" "$(jq -c '.profiles[1] | [.session.pct, .weekly.pct, .fable.pct]' "$SB/status.json")"
+  assert_eq "threshold from the manifest" "90" "$(jq .threshold "$SB/status.json")"
+  assert_eq "now is hydra's clock" "$NOW" "$(jq .now "$SB/status.json")"
+  assert_eq "dir is the expanded path" "$HYDRA_HOME/profiles/a" "$(jq -r '.profiles[0].dir' "$SB/status.json")"
+  assert_eq "email" "a@example.com" "$(jq -r '.profiles[0].email' "$SB/status.json")"
+  assert_eq "signed_in / disabled / locked" "true false false" "$(jq -r '.profiles[0] | "\(.signed_in) \(.disabled) \(.locked)"' "$SB/status.json")"
+  assert_eq "fetched_at / source / auth" "$NOW api ok" "$(jq -r '.profiles[0] | "\(.fetched_at) \(.source) \(.auth)"' "$SB/status.json")"
+  assert_eq "resets are epoch seconds" "4070908800" "$(jq '.profiles[0].session.resets' "$SB/status.json")"
+  assert_eq "severity is passed through" "normal" "$(jq -r '.profiles[0].weekly.severity' "$SB/status.json")"
+  assert_eq "state" "ok" "$(jq -r '.profiles[0].state' "$SB/status.json")"
+  jq '.threshold = 20' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
+  assert_eq "a custom threshold is reported" "20" "$(statusj .threshold --cached)"
+  assert_eq "nothing secret: no token anywhere in the document" "0" "$(grep -c 'tok-' "$SB/status.json" | tr -d ' ')"
+fi
+
+if test "status: --json state agrees with the table, row for row"; then
+  add a; add b; add c "" --no-login; add d; add e; add f; add g
+  set_usage a 5 92 5                                    # over the threshold
+  set_usage b 1 0 0; "$HYDRA" disable b >/dev/null 2>&1 # disabled
+  rm -f "$HYDRA_HOME/cache/d.json"                      # signed in, never fetched
+  LOCKED='"some_reason"' set_usage e 0 0 0              # locked
+  set_usage f 0 0 0; FAKE_CURL_CODE=401 "$HYDRA" refresh --force f >/dev/null   # token lapsed
+  set_usage g 1 2 3                                     # fine
+  json=$("$HYDRA" status --json --cached); table=$("$HYDRA" status --cached)
+  same_state() { # <name> <expected state>: the JSON says so, and so does the table row
+    assert_eq "json: $1 is '$2'" "$2" "$(printf '%s' "$json" | jq -r --arg n "$1" '.profiles[] | select(.name == $n) | .state')"
+    assert_contains "table: $1 row agrees" "$2" "$(printf '%s' "$table" | grep "^$1 ")"
+  }
+  same_state a exhausted
+  same_state b disabled
+  same_state c "not signed in on this machine"
+  same_state d "no usage data yet"
+  same_state e locked
+  same_state f "token stale — refreshes on next launch"
+  same_state g ok
+  assert_eq "every state is one of the documented strings" "" "$(printf '%s' "$json" | jq -r '.profiles[].state
+    | select(. as $s | ["not signed in on this machine","disabled","locked","exhausted","token stale — refreshes on next launch","no usage data yet","ok"] | index($s) == null)')"
+  assert_eq "missing windows are null, not errors" "null null null" "$(printf '%s' "$json" | jq -r '.profiles[] | select(.name == "d") | "\(.session) \(.weekly) \(.fable)"')"
+fi
+
+if test "status: --json puts nothing but the document on stdout"; then
+  assert_fails "no profiles: dies like the table does" "$HYDRA" status --json --cached
+  add a; set_usage a 1 2 3
+  out=$("$HYDRA" status --json --cached 2>/dev/null)
+  assert_eq "exactly one JSON document" "1" "$(printf '%s\n' "$out" | jq -c . 2>/dev/null | wc -l | tr -d ' ')"
+  assert_not_contains "no table header" "PROFILE" "$out"
+  out=$(HYDRA_NOW=$((NOW + 200)) "$HYDRA" status --json 2>/dev/null)   # stale → the refresh runs, silently
+  assert_eq "a refresh leaves stdout clean too" "1" "$(printf '%s\n' "$out" | jq -c . 2>/dev/null | wc -l | tr -d ' ')"
+  assert_eq "…and the refresh happened" "$((NOW + 200))" "$(printf '%s' "$out" | jq '.profiles[0].fetched_at')"
+fi
+
+if test "status: --json --force refreshes first and reports the new numbers"; then
+  add a; set_usage a 1 1 1
+  usage 44 55 66 >"$FAKE_CURL_BODY"; : >"$FAKE_LOG"
+  assert_eq "--cached: the old numbers, no request" "[1,1,1]" "$(statusj '.profiles[0] | [.session.pct, .weekly.pct, .fable.pct] | tostring' --cached)"
+  assert_eq "no request made" "0" "$(curl_calls)"
+  assert_eq "fresh data is not refetched without --force" "[1,1,1]" "$(statusj '.profiles[0] | [.session.pct, .weekly.pct, .fable.pct] | tostring')"
+  assert_eq "still no request" "0" "$(curl_calls)"
+  assert_eq "--force: the refreshed numbers" "[44,55,66]" "$(statusj '.profiles[0] | [.session.pct, .weekly.pct, .fable.pct] | tostring' --force)"
+  assert_eq "one request" "1" "$(curl_calls)"
 fi
 
 if test "HYDRA_MANIFEST relocates the manifest"; then

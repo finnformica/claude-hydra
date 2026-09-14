@@ -37,7 +37,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
       case "${words[2]}" in
         login|remove|rm|rename|enable|disable|dir|has|refresh|link|exec) _hydra_profiles ;;
         add) [[ "${words[CURRENT]}" == -* ]] && compadd -- --existing --dir --no-login ;;
-        status) compadd -- --cached --force ;;
+        status) compadd -- --cached --force --json ;;
         bin) compadd -- --unset; _files ;;
         *) _files ;;
       esac
@@ -65,6 +65,7 @@ elif [ -n "${BASH_VERSION:-}" ]; then
       case "$cmd" in
         login|remove|rm|rename|enable|disable|dir|has|refresh|link|exec)
           COMPREPLY=($(compgen -W "$(hydra names 2>/dev/null)" -- "$cur")) ;;
+        status) COMPREPLY=($(compgen -W "--cached --force --json" -- "$cur")) ;;
         *) COMPREPLY=($(compgen -f -- "$cur")) ;;
       esac
     fi

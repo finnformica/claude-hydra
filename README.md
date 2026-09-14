@@ -80,7 +80,7 @@ printed when stderr is a terminal.
 | `hydra rename <old> <new>` | relabel a profile; its sign-in is untouched |
 | `hydra disable <name>` · `hydra enable <name>` | keep a profile signed in but out of the rotation (`claude <name>` still works) |
 | `hydra list` | profiles and their config dirs |
-| `hydra status [--cached\|--force]` | usage table; refreshes anything older than 3 minutes |
+| `hydra status [--cached\|--force] [--json]` | usage table; refreshes anything older than 3 minutes. `--json` prints the same rows (every profile, all three windows, plus `state`) as one JSON document for scripts |
 | `hydra refresh [names…] [--force]` | fetch usage now |
 | `hydra pick [--json] [--model M]` | which profile a bare `claude` (or `claude --model M`) would use right now |
 | `hydra link [names…] [--force]` | (re)apply the shared-config symlinks |
