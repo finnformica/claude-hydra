@@ -94,7 +94,6 @@ profile_names() { manifest | jq -r '.profiles | keys[]'; }
 profile_count() { manifest | jq -r '.profiles | length'; }
 profile_dir() { expand "$(manifest | jq -r --arg n "$1" '.profiles[$n].dir')"; }
 profile_disabled() { manifest | jq -e --arg n "$1" '.profiles[$n].disabled == true' >/dev/null 2>&1; }
-enabled_names() { manifest | jq -r '.profiles | to_entries[] | select(.value.disabled != true) | .key'; }
 is_default_dir() { [ "$1" = "$DEFAULT_DIR" ]; }
 
 require_profile() { has_profile "$1" || die "no profile named '$1' (hydra list)"; }
@@ -682,11 +681,8 @@ cmd_status() {
   if winner=$(shim_bypassed_by); then
     say "hydra: warning: the claude shim is installed but ${winner:-nothing} wins a PATH search, so direct launches skip hydra (hydra doctor)"
   fi
-  # Every row is refreshed, disabled ones included: `refresh` alone skips them
-  # because a launch never needs their numbers, but status shows them, and a
-  # profile disabled before its first fetch would otherwise stay null for good.
   if [ "$cached" -eq 0 ]; then
-    if [ "$force" -eq 1 ]; then refresh --force $(profile_names) >/dev/null; else refresh --stale $(profile_names) >/dev/null; fi
+    if [ "$force" -eq 1 ]; then refresh --force >/dev/null; else refresh --stale >/dev/null; fi
   fi
   local threshold; threshold=$(manifest | jq -r '.threshold // 90')
   if [ "$json" -eq 1 ]; then
