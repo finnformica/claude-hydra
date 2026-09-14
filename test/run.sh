@@ -28,6 +28,7 @@ assert_not_contains() { case "$3" in *"$2"*) fail "$1" "did not expect [$2] in [
 assert_ok()           { if "${@:2}" >/dev/null 2>&1; then ok "$1"; else fail "$1" "command failed: ${*:2}"; fi; }
 assert_fails()        { if "${@:2}" >/dev/null 2>&1; then fail "$1" "command unexpectedly succeeded: ${*:2}"; else ok "$1"; fi; }
 assert_link()         { if [ -L "$2" ] && [ "$(readlink "$2")" = "$3" ]; then ok "$1"; else fail "$1" "$2 is not a link to $3"; fi; }
+skip()                { N=$((N + 1)); PASS=$((PASS + 1)); printf 'ok %d - %s # SKIP %s\n' "$N" "$1" "$2"; }
 
 # `test "name"` — starts a test if it matches the filter; returns 1 to skip.
 test() {
@@ -98,6 +99,27 @@ add() { local n=$1 e=${2:-$1@example.com}; shift; shift 2>/dev/null || true; FAK
 set_usage() { local n=$1; shift; usage "$@" >"$SB/u-$n.json"; FAKE_CURL_BODY="$SB/u-$n.json" "$HYDRA" refresh --force "$n" >/dev/null; }
 
 cache() { cat "$HYDRA_HOME/cache/$1.json"; }
+real() { printf '%s/%s' "$(cd "$(dirname "$1")" && pwd -P)" "$(basename "$1")"; }   # what hydra bin prints (macOS: /var → /private/var)
+
+# shim_install: install.sh --shim into the sandbox's own bin dir, then put that dir first on PATH
+# so that `claude` by name is the shim; the fake claude in $SB/bin stays the "real" binary behind it.
+shim_install() { mkdir -p "$SB/lbin"; HYDRA_BIN_DIR="$SB/lbin" HYDRA_RC="$SB/rc" "$ROOT/install.sh" "$@" 2>&1; }
+shim_on()      { shim_install --shim >/dev/null || fail "install.sh --shim" "failed"; export PATH="$SB/lbin:$PATH"; }
+
+# with_tty <shell command>: run it on a pseudo-terminal (stderr included) and print what appeared there.
+has_tty()  { command -v script >/dev/null 2>&1; }
+with_tty() { if script --version >/dev/null 2>&1; then script -qec "$1" /dev/null; else script -q /dev/null bash -c "$1"; fi; }
+
+# tool_path: a PATH holding every tool hydra and install.sh need, and nothing called claude.
+tool_path() {
+  local t p
+  mkdir -p "$SB/toolbin"
+  for t in env bash sh jq cat cut tr awk date mv rm mkdir head grep uname readlink ln chmod dirname basename ls cp wc sed shasum sha256sum; do
+    p=$(command -v "$t" 2>/dev/null) && [ -x "$p" ] && ln -sf "$p" "$SB/toolbin/$t"
+  done
+  ln -sf "$SB/bin/curl" "$SB/toolbin/curl"
+  printf '%s' "$SB/toolbin"
+}
 manifest() { cat "$HYDRA_HOME/profiles.json"; }
 pick() { "$HYDRA" pick "$@"; }
 pickj() { local f=$1; shift; "$HYDRA" pick --json "$@" | jq -r "$f"; }
@@ -141,7 +163,7 @@ if test "add --no-login skips the sign-in"; then
 fi
 
 if test "add rejects unusable names"; then
-  for bad in mcp auth update add exec pick auto best Work -x "a b" ""; do
+  for bad in mcp auth update add exec pick bin auto best Work -x "a b" ""; do
     assert_fails "rejects '$bad'" "$HYDRA" add "$bad" --no-login
   done
   add w "" --no-login
@@ -331,7 +353,7 @@ if test "pick: when everything is exhausted, the least-bad one is still returned
   set_usage a 99 0 0; set_usage b 91 0 0
   assert_eq "b is least bad" b "$(pick)"
   assert_eq "flagged exhausted" "true" "$(pickj .exhausted)"
-  assert_contains "exec warns" "everything is near its limit" "$(HYDRA_QUIET= "$HYDRA" exec x 2>&1 >/dev/null)"
+  assert_contains "exec warns" "everything is near its limit" "$(HYDRA_QUIET=0 "$HYDRA" exec x 2>&1 >/dev/null)"
 fi
 
 if test "pick: a locked account is set aside"; then
@@ -416,7 +438,7 @@ if test "exec: passthrough cases"; then
   assert_contains "claude subcommand: auth" "dir=<unset>" "$("$HYDRA" exec auth status)"
   assert_contains "--version" "9.9.9" "$("$HYDRA" exec --version)"
   assert_contains "--help" "dir=<unset>" "$("$HYDRA" exec --help)"
-  assert_eq "no hint for passthrough" "" "$(HYDRA_QUIET= "$HYDRA" exec mcp list 2>&1 >/dev/null)"
+  assert_eq "no hint for passthrough" "" "$(HYDRA_QUIET=0 "$HYDRA" exec mcp list 2>&1 >/dev/null)"
 fi
 
 if test "exec: routes a bare launch and keeps every argument"; then
@@ -426,11 +448,11 @@ if test "exec: routes a bare launch and keeps every argument"; then
   assert_contains "args intact (1)" "arg=[-p]" "$out"
   assert_contains "args intact (2)" "arg=[two words]" "$out"
   assert_contains "args intact (3)" "arg=[--model]" "$out"
-  out=$(HYDRA_QUIET= "$HYDRA" exec -p hi 2>&1 >/dev/null)
+  out=$(HYDRA_QUIET=0 "$HYDRA" exec -p hi 2>&1 >/dev/null)
   assert_contains "hint names the profile" "hydra → w" "$out"
   assert_contains "hint shows 5h" "5h 0%" "$out"
   assert_contains "hint shows Fable" "Fable 0%" "$out"
-  out=$(HYDRA_QUIET= "$HYDRA" exec --model opus 2>&1 >/dev/null)
+  out=$(HYDRA_QUIET=0 "$HYDRA" exec --model opus 2>&1 >/dev/null)
   assert_contains "opus hint says Fable is ignored" "(opus: Fable window ignored)" "$out"
   assert_eq "HYDRA_QUIET silences the hint" "" "$(HYDRA_QUIET=1 "$HYDRA" exec -p hi 2>&1 >/dev/null)"
 fi
@@ -452,7 +474,7 @@ fi
 
 if test "exec: nobody signed in → plain claude with a hint"; then
   add w "" --no-login
-  out=$(HYDRA_QUIET= "$HYDRA" exec -p hi 2>&1)
+  out=$(HYDRA_QUIET=0 "$HYDRA" exec -p hi 2>&1)
   assert_contains "launches anyway" "dir=<unset>" "$out"
   assert_contains "explains" "no signed-in profile" "$out"
 fi
@@ -461,7 +483,7 @@ if test "exec: refreshes stale data in the background, never in the launch path"
   add w; set_usage w 0 0 0
   jq '.fetched_at = 1' "$HYDRA_HOME/cache/w.json" >"$SB/c" && mv "$SB/c" "$HYDRA_HOME/cache/w.json"
   usage 33 0 0 >"$FAKE_CURL_BODY"
-  out=$(HYDRA_QUIET= "$HYDRA" exec x 2>&1)
+  out=$(HYDRA_QUIET=0 "$HYDRA" exec x 2>&1)
   assert_contains "launch used the stale numbers" "5h 0%" "$out"
   for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(cache w | jq .fetched_at)" = "$NOW" ] && break; sleep 0.3; done
   assert_eq "cache refreshed afterwards" "33" "$(cache w | jq '.limits[0].percent')"
@@ -479,6 +501,161 @@ if test "the claude() shell function wraps the binary"; then
   assert_contains "routed via the function" "dir=$HYDRA_HOME/profiles/w" "$out"
   out=$(PATH="$SB/bin:/usr/bin:/bin" bash -c "source '$ROOT/hydra.sh'; claude -p hi")
   assert_contains "without hydra on PATH it falls back to the binary" "dir=<unset>" "$out"
+fi
+
+if test "exec: the routing hint only goes to a terminal"; then
+  add w; set_usage w 0 0 0
+  HYDRA_QUIET= "$HYDRA" exec -p hi 2>"$SB/err" >/dev/null
+  assert_eq "stderr captured to a file gets nothing from hydra" "" "$(cat "$SB/err")"
+  assert_eq "…the launch still happened" "1" "$(grep -c '^claude -p hi' "$FAKE_LOG")"
+  assert_eq "HYDRA_QUIET=1 is quiet even on a pipe" "" "$(HYDRA_QUIET=1 "$HYDRA" exec -p hi 2>&1 >/dev/null)"
+  assert_contains "HYDRA_QUIET=0 forces the hint onto a pipe" "hydra → w" "$(HYDRA_QUIET=0 "$HYDRA" exec -p hi 2>&1 >/dev/null)"
+  if has_tty; then
+    assert_contains "a terminal still gets it" "hydra → w" "$(with_tty "HYDRA_QUIET= '$HYDRA' exec -p hi >/dev/null")"
+    assert_not_contains "HYDRA_QUIET=1 silences a terminal too" "hydra" "$(with_tty "HYDRA_QUIET=1 '$HYDRA' exec -p hi >/dev/null")"
+  else
+    skip "a terminal still gets it" "no script(1) to allocate a pty"
+  fi
+fi
+
+# ---------------------------------------------------------------- the shim
+
+if test "bin: the real claude is never hydra or its shim"; then
+  fake=$(real "$SB/bin/claude")
+  assert_eq "first claude on PATH, resolved" "$fake" "$("$HYDRA" bin)"
+  mkdir -p "$SB/shimbin"; ln -s "$ROOT/claude-shim" "$SB/shimbin/claude"
+  assert_eq "a shim ahead of it on PATH is skipped" "$fake" "$(PATH="$SB/shimbin:$PATH" "$HYDRA" bin)"
+  ln -sf "$ROOT/hydra" "$SB/shimbin/claude"
+  assert_eq "hydra itself ahead of it is skipped" "$fake" "$(PATH="$SB/shimbin:$PATH" "$HYDRA" bin)"
+  assert_fails "HYDRA_CLAUDE_BIN pointing at the shim is refused" env HYDRA_CLAUDE_BIN="$ROOT/claude-shim" "$HYDRA" bin
+  assert_fails "HYDRA_CLAUDE_BIN pointing nowhere is refused" env HYDRA_CLAUDE_BIN="$SB/nope" "$HYDRA" bin
+  assert_fails "hydra bin PATH refuses the shim" "$HYDRA" bin "$ROOT/claude-shim"
+  assert_fails "'bin' is a reserved profile name" "$HYDRA" add bin --no-login
+  mkdir -p "$SB/other"; cp "$SB/bin/claude" "$SB/other/claude"
+  "$HYDRA" bin "$SB/other/claude" 2>/dev/null
+  assert_eq "hydra bin PATH records it resolved" "$(real "$SB/other/claude")" "$(manifest | jq -r .claude_bin)"
+  assert_eq "…and the manifest entry wins over PATH" "$(real "$SB/other/claude")" "$("$HYDRA" bin)"
+  assert_eq "HYDRA_CLAUDE_BIN beats the manifest" "$fake" "$(HYDRA_CLAUDE_BIN="$SB/bin/claude" "$HYDRA" bin)"
+  jq '.claude_bin = "/nowhere/claude"' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
+  assert_eq "an entry that does not run here falls back to PATH" "$fake" "$("$HYDRA" bin)"
+  "$HYDRA" bin --unset 2>/dev/null
+  assert_eq "--unset forgets it" "null" "$(manifest | jq -r .claude_bin)"
+  assert_fails "no real claude anywhere is a clear failure" env PATH="$SB/shimbin:$(tool_path)" "$HYDRA" bin
+  assert_contains "…that says so" "no claude binary on PATH apart from hydra's own shim" "$(PATH="$SB/shimbin:$(tool_path)" "$HYDRA" bin 2>&1)"
+fi
+
+if test "shim: claude -p from any launcher is routed to the real binary"; then
+  add personal "" --existing; add w; set_usage w 0 0 0; set_usage personal 50 0 0
+  shim_on
+  assert_link "the claude on PATH is the shim" "$SB/lbin/claude" "$ROOT/claude-shim"
+  assert_eq "claude_bin recorded, resolved" "$(real "$SB/bin/claude")" "$(manifest | jq -r .claude_bin)"
+  : >"$FAKE_LOG"
+  out=$(bash -c 'claude -p "x y" --output-format json' 2>"$SB/err")
+  assert_contains "routed to w" "dir=$HYDRA_HOME/profiles/w" "$out"
+  assert_contains "args intact (1)" "arg=[-p]" "$out"
+  assert_contains "args intact (2)" "arg=[x y]" "$out"
+  assert_contains "args intact (3)" "arg=[--output-format]" "$out"
+  assert_contains "args intact (4)" "arg=[json]" "$out"
+  assert_eq "the real binary ran exactly once — no recursion" "1" "$(grep -c '^claude -p' "$FAKE_LOG")"
+  assert_eq "a headless caller sees nothing on stderr" "" "$(cat "$SB/err")"
+  set_usage w 60 0 0
+  assert_contains "the default profile leaves CLAUDE_CONFIG_DIR unset" "dir=<unset>" "$(bash -c 'claude -p hi')"
+  assert_contains "a named profile still works through the shim" "dir=$HYDRA_HOME/profiles/w" "$(bash -c 'claude w -p hi')"
+  assert_contains "claude subcommands still pass through" "arg=[list]" "$(bash -c 'claude mcp list')"
+  assert_contains "--version too" "9.9.9" "$(bash -c 'claude --version')"
+  assert_contains "the shell function and the shim agree" "dir=<unset>" "$(bash -c "source '$ROOT/hydra.sh'; claude -p hi")"
+  if has_tty; then
+    assert_contains "a terminal gets the hint through the shim" "hydra → personal" "$(with_tty "HYDRA_QUIET= claude -p hi >/dev/null")"
+  fi
+fi
+
+if test "shim: claude -p --model opus picks by Opus intent"; then
+  add a; add b; set_usage a 10 20 90; set_usage b 30 70 10   # a: Fable spent; b: weekly heavy
+  shim_on
+  assert_contains "Fable session → b" "dir=$HYDRA_HOME/profiles/b" "$(bash -c 'claude -p hi')"
+  assert_contains "opus → a, whose spent Fable window is irrelevant" "dir=$HYDRA_HOME/profiles/a" "$(bash -c 'claude -p hi --model opus')"
+  assert_contains "--model=opus form" "dir=$HYDRA_HOME/profiles/a" "$(bash -c 'claude --model=opus -p hi')"
+  assert_contains "the model argument is passed on" "arg=[opus]" "$(bash -c 'claude -p hi --model opus')"
+fi
+
+if test "shim: an explicit CLAUDE_CONFIG_DIR bypasses routing"; then
+  add w; set_usage w 0 0 0
+  shim_on; : >"$FAKE_LOG"
+  out=$(CLAUDE_CONFIG_DIR=/x bash -c 'claude -p hi --output-format json')
+  assert_contains "passed through unchanged" "dir=/x" "$out"
+  assert_contains "args intact" "arg=[--output-format]" "$out"
+  assert_eq "no usage fetch on the way" "0" "$(curl_calls)"
+fi
+
+if test "shim: the recursion tripwire stops a shim that resolves to itself"; then
+  out=$(bash -c 'HYDRA_LAUNCH_PID=$$ exec "$1" -p hi' _ "$ROOT/claude-shim" 2>&1); rc=$?
+  assert_eq "exits 70" "70" "$rc"
+  assert_contains "explains" "launched recursively" "$out"
+  assert_eq "nothing launched" "" "$(cat "$FAKE_LOG" 2>/dev/null)"
+fi
+
+if test "shim: install.sh --shim replaces ~/.local/bin/claude and --unshim puts it back"; then
+  # The macOS native layout: ~/.local/bin/claude is a symlink to the versioned binary.
+  mkdir -p "$SB/real" "$SB/lbin"; mv "$SB/bin/claude" "$SB/real/claude"; ln -s "$SB/real/claude" "$SB/lbin/claude"
+  export PATH="$SB/lbin:$SB/bin:$ORIG_PATH"
+  add w; set_usage w 0 0 0
+  out=$(shim_install --shim)
+  assert_contains "says what it replaced" "replaced $SB/lbin/claude → $SB/real/claude" "$out"
+  assert_link "the shim is in place" "$SB/lbin/claude" "$ROOT/claude-shim"
+  assert_link "the original link is kept" "$SB/lbin/claude.hydra-bak" "$SB/real/claude"
+  assert_eq "claude_bin is the resolved binary, not the replaced link" "$(real "$SB/real/claude")" "$(manifest | jq -r .claude_bin)"
+  assert_contains "a bare launch is routed" "dir=$HYDRA_HOME/profiles/w" "$(bash -c 'claude -p hi')"
+  out=$(shim_install --shim)
+  assert_contains "--shim again is a no-op" "already installed" "$out"
+  assert_link "…shim still there" "$SB/lbin/claude" "$ROOT/claude-shim"
+  assert_eq "…claude_bin unchanged" "$(real "$SB/real/claude")" "$(manifest | jq -r .claude_bin)"
+  out=$(shim_install --unshim)
+  assert_contains "--unshim reports the restore" "restored $SB/lbin/claude → $SB/real/claude" "$out"
+  assert_link "the original link is back" "$SB/lbin/claude" "$SB/real/claude"
+  assert_eq "the backup is gone" "" "$(ls "$SB/lbin/claude.hydra-bak" 2>/dev/null)"
+  assert_eq "claude_bin is forgotten" "null" "$(manifest | jq -r .claude_bin)"
+  assert_contains "a bare binary launch is unrouted again" "dir=<unset>" "$(bash -c 'claude -p hi')"
+  assert_contains "the shell function still routes" "dir=$HYDRA_HOME/profiles/w" "$(bash -c "source '$ROOT/hydra.sh'; claude -p hi")"
+  assert_ok "--unshim again is fine" shim_install --unshim
+  assert_link "…and touches nothing" "$SB/lbin/claude" "$SB/real/claude"
+fi
+
+if test "shim: a real binary at ~/.local/bin/claude is moved aside, not deleted"; then
+  mkdir -p "$SB/lbin"; mv "$SB/bin/claude" "$SB/lbin/claude"
+  export PATH="$SB/lbin:$SB/bin:$ORIG_PATH"
+  add w; set_usage w 0 0 0
+  out=$(shim_install --shim)
+  assert_contains "says it moved it" "moved the real binary $SB/lbin/claude to $SB/lbin/claude.hydra-bak" "$out"
+  assert_eq "the binary survives" "1" "$(ls "$SB/lbin/claude.hydra-bak" | wc -l | tr -d ' ')"
+  assert_eq "claude_bin points at the moved file" "$(real "$SB/lbin/claude.hydra-bak")" "$(manifest | jq -r .claude_bin)"
+  assert_contains "routed" "dir=$HYDRA_HOME/profiles/w" "$(bash -c 'claude -p hi')"
+  shim_install --unshim >/dev/null
+  assert_eq "moved back" "1" "$(ls "$SB/lbin/claude" | wc -l | tr -d ' ')"
+  assert_eq "no link left behind" "" "$(readlink "$SB/lbin/claude" 2>/dev/null)"
+  assert_contains "runs directly again" "dir=<unset>" "$(bash -c 'claude -p hi')"
+fi
+
+if test "shim: install.sh --shim refuses when the real binary cannot be resolved"; then
+  tools=$(tool_path)
+  out=$(PATH="$tools" shim_install --shim); rc=$?
+  assert_eq "no claude on PATH: exit 1" "1" "$rc"
+  assert_contains "…and says so" "cannot find the real claude binary" "$out"
+  assert_eq "…nothing linked" "" "$(ls "$SB/lbin/claude" 2>/dev/null)"
+  mkdir -p "$SB/only"; ln -s "$ROOT/claude-shim" "$SB/only/claude"
+  out=$(PATH="$SB/only:$tools" shim_install --shim); rc=$?
+  assert_eq "the only claude is the shim itself: exit 1" "1" "$rc"
+  assert_contains "…refused" "cannot find the real claude binary" "$out"
+  ln -sf "$ROOT/hydra" "$SB/only/claude"
+  out=$(PATH="$SB/only:$tools" shim_install --shim); rc=$?
+  assert_eq "claude resolving to hydra itself: exit 1" "1" "$rc"
+  assert_eq "…nothing linked" "" "$(ls "$SB/lbin/claude" 2>/dev/null)"
+  assert_eq "…nothing recorded" "" "$(jq -r '.claude_bin // empty' "$HYDRA_HOME/profiles.json" 2>/dev/null)"
+  out=$(HYDRA_CLAUDE_BIN="$ROOT/claude-shim" shim_install --shim); rc=$?
+  assert_eq "HYDRA_CLAUDE_BIN at the shim is refused even with a real claude on PATH" "1" "$rc"
+  mkdir -p "$SB/pinned"; cp "$SB/bin/claude" "$SB/pinned/claude"
+  if HYDRA_CLAUDE_BIN="$SB/pinned/claude" shim_install --shim >/dev/null; then ok "HYDRA_CLAUDE_BIN names the binary to record"; else fail "HYDRA_CLAUDE_BIN names the binary to record" "install.sh failed"; fi
+  assert_eq "…and it is the one recorded" "$(real "$SB/pinned/claude")" "$(manifest | jq -r .claude_bin)"
+  assert_eq "hydra itself is still linked by the plain install" "1" "$(ls "$SB/lbin/hydra" | wc -l | tr -d ' ')"
 fi
 
 # ---------------------------------------------------------------- misc

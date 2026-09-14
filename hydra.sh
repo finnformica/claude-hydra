@@ -27,6 +27,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
       'rename:relabel a profile' 'enable:put a profile back in the rotation' 'disable:take a profile out of the rotation' 'list:profiles and config dirs' 'status:usage per profile'
       'refresh:fetch usage now' 'pick:which profile a bare claude would use'
       'link:reapply shared-config symlinks' 'dir:print a config dir' 'exec:launch claude on a profile'
+      'bin:the real claude binary hydra execs'
       'help:show help'
     )
     if (( CURRENT == 2 )); then
@@ -37,6 +38,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
         login|remove|rm|rename|enable|disable|dir|has|refresh|link|exec) _hydra_profiles ;;
         add) [[ "${words[CURRENT]}" == -* ]] && compadd -- --existing --dir --no-login ;;
         status) compadd -- --cached --force --json ;;
+        bin) compadd -- --unset; _files ;;
         *) _files ;;
       esac
     fi
@@ -56,7 +58,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
 elif [ -n "${BASH_VERSION:-}" ]; then
   _hydra_bash() {
     local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
-    local cmds="add login remove rename enable disable list status refresh pick link dir exec help"
+    local cmds="add login remove rename enable disable list status refresh pick link dir exec bin help"
     if [ "$COMP_CWORD" -eq 1 ]; then
       COMPREPLY=($(compgen -W "$cmds $(hydra names 2>/dev/null)" -- "$cur"))
     else
