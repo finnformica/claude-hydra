@@ -50,25 +50,47 @@ hydra status
 The install above defines a `claude` shell *function*, so only launches typed
 into your shell are routed. Anything that spawns the `claude` binary directly —
 an editor integration, a script running `claude -p …`, another tool — lands on
-the default profile. To route those as well, put hydra's shim in place of the
-binary:
+the default profile. To route those as well, install hydra's shim:
 
 ```sh
 ~/.local/share/claude-hydra/install.sh --shim
+exec $SHELL
+hydra doctor                     # confirms the shim is what a bare `claude` runs
 ```
 
-This records where the real binary is (`hydra bin`), moves whatever was at
-`~/.local/bin/claude` aside as `claude.hydra-bak` — on a native macOS install
-that is the symlink to the versioned binary — and links `~/.local/bin/claude`
-to the shim, which runs `hydra exec "$@"`. It prints exactly what it replaced,
-refuses to install if it cannot find a real binary (or the only one it finds
-is itself), and is idempotent. `install.sh --unshim` puts the original back.
+The shim is a `claude` at `~/.hydra/bin/claude` (`$HYDRA_HOME/bin`) that runs
+`hydra exec "$@"`. It *shadows* the real binary rather than replacing it:
+`~/.local/bin/claude` is never touched, `hydra.sh` puts `~/.hydra/bin` first on
+PATH for every shell (the installer adds an `export PATH=…` line to your rc as
+well), and on each launch hydra finds the real binary afresh — the first
+`claude` on PATH that is not its own shim — and execs it by path. Claude Code's
+updater can rewrite `~/.local/bin/claude` whenever it likes; the shim stays
+where it is and the next launch runs the new version. Nothing is pinned, so
+nothing goes stale.
 
-hydra never runs `claude` by name once the shim is in — it execs the recorded
-binary by path — so nothing recurses. An explicit `CLAUDE_CONFIG_DIR` in the
-environment still bypasses routing entirely; that is how a caller pins a
-profile. Headless callers get a clean stderr: the routing hint is only
-printed when stderr is a terminal.
+Launchers that do not read your shell rc — a systemd unit, a launchd agent, an
+editor started from the Dock — need `~/.hydra/bin` ahead of the real binary in
+*their* PATH too:
+
+```ini
+# systemd: ~/.config/systemd/user/something.service
+Environment=PATH=%h/.hydra/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+`hydra doctor` reports whether the shim is installed, whether `~/.hydra/bin`
+comes before the directory holding the real binary on PATH, which binary hydra
+would exec right now and that it is not the shim itself; it exits non-zero with
+a one-line fix for anything wrong. `hydra status` also prints one warning line
+on stderr when the shim is installed but a direct `claude` would bypass it, so
+the silent case is never silent. `install.sh --unshim` removes the shim and the
+PATH line; both directions are idempotent, and `--shim` migrates a machine that
+used the previous layout (the shim in place of `~/.local/bin/claude`, with a
+`claude.hydra-bak` beside it), restoring the original and printing what it did.
+
+An explicit `CLAUDE_CONFIG_DIR` in the environment still bypasses routing
+entirely; that is how a caller pins a profile. Headless callers get a clean
+stderr: the routing hint is only printed when stderr is a terminal. If the
+shim is ever launched by hydra itself it stops with exit 70 instead of looping.
 
 ## Commands
 
@@ -87,7 +109,8 @@ printed when stderr is a terminal.
 | `hydra dir <name>` · `hydra has <name>` | plumbing for scripts |
 | `hydra exec [profile] [claude args…]` | what the `claude` shell function and the shim call |
 | `hydra <profile> [claude args…]` | shorthand for `hydra exec <profile> …` |
-| `hydra bin [PATH \| --unset]` | the real `claude` binary hydra execs; record one, or forget it and search PATH again |
+| `hydra bin [PATH \| --unset]` | the real `claude` binary hydra execs, found on PATH at every launch; `PATH` pins one instead (it will not follow updates), `--unset` drops the pin |
+| `hydra doctor` | check the shim: installed, first on PATH, and what a launch would actually run; non-zero with a fix per finding |
 
 Tab completion (zsh and bash) comes with `hydra.sh`: `hydra <Tab>` offers
 commands and profiles, `hydra login <Tab>` and `claude <Tab>` offer profiles.
@@ -95,10 +118,10 @@ commands and profiles, `hydra login <Tab>` and `claude <Tab>` offer profiles.
 The one-line routing hint is printed only when stderr is a terminal, so a
 script capturing stderr never sees it; `HYDRA_QUIET=1` always suppresses it and
 `HYDRA_QUIET=0` always prints it. `HYDRA_MODEL=opus` scores launches for that
-model when no `--model` is passed. `HYDRA_CLAUDE_BIN` names the real binary for
-one invocation (it beats `claude_bin` in the manifest). `HYDRA_HOME` (default
-`~/.hydra`) and `HYDRA_MANIFEST` (default `$HYDRA_HOME/profiles.json`) move the
-state.
+model when no `--model` is passed. `HYDRA_CLAUDE_BIN` pins the real binary for
+one invocation (it beats `claude_bin` in the manifest, which beats the PATH
+search). `HYDRA_HOME` (default `~/.hydra`) and `HYDRA_MANIFEST` (default
+`$HYDRA_HOME/profiles.json`) move the state.
 
 ## How a profile is chosen
 
@@ -130,7 +153,6 @@ Threshold, weights, grace and default model live in `profiles.json`:
   "weights": { "session": 1, "fable": 1, "weekly": 1 },
   "reset_grace_minutes": 10,
   "default_model": "fable",
-  "claude_bin": "~/.local/share/claude/versions/2.1.0",
   "profiles": {
     "personal": { "dir": "~/.claude", "email": "you@example.com" },
     "work":     { "dir": "~/.hydra/profiles/work", "email": "you@work.example", "disabled": true }
@@ -138,9 +160,11 @@ Threshold, weights, grace and default model live in `profiles.json`:
 }
 ```
 
-`claude_bin` is written by `install.sh --shim` (or `hydra bin PATH`) and is the
-one machine-specific entry: on a machine where it does not run, hydra falls
-back to the first `claude` on PATH that is not its own shim.
+An optional `claude_bin` (set with `hydra bin PATH`) pins the binary hydra
+execs; it is machine-specific and does not follow Claude Code updates, so leave
+it unset unless you need it — the default is the first `claude` on PATH that is
+not hydra's own shim, found at every launch. A pin that does not run on this
+machine is ignored.
 
 A disabled profile stays signed in and shows in `hydra status`, but is never
 auto-picked; `claude work` still launches it explicitly.
@@ -181,11 +205,13 @@ for any profile that laptop hasn't logged into yet.
   and starts immediately; stale caches are refreshed in a detached background
   process for the next launch. Polling is floored at 180 s because the
   endpoint rate-limits anything faster.
-- **The real binary is always exec'd by path**, never by the name `claude`:
-  `HYDRA_CLAUDE_BIN`, else `claude_bin` in the manifest, else the first
-  `claude` on PATH that is not the shim (the shim carries a marker in its
-  header). If the shim ever finds itself launched by hydra it stops with an
-  error instead of looping.
+- **The real binary is always exec'd by path**, never by the name `claude`,
+  and found at every launch: the first `claude` on PATH that is not the shim
+  (the shim carries a marker in its header). `HYDRA_CLAUDE_BIN` and
+  `claude_bin` in the manifest are explicit pins on top of that. The shim
+  lives in `~/.hydra/bin`, ahead of the real binary on PATH, so an update that
+  rewrites `~/.local/bin/claude` changes nothing for hydra. If the shim ever
+  finds itself launched by hydra it stops with an error instead of looping.
 
 ## Limitations
 
@@ -203,10 +229,9 @@ for any profile that laptop hasn't logged into yet.
   or use project scope.
 - Claude Code writes settings atomically; if an update ever replaces the
   `settings.json` symlink with a real file, `hydra link --force` restores it.
-- Claude Code's own updater rewrites `~/.local/bin/claude` on a native install,
-  which removes the shim and leaves `claude_bin` pointing at the previous
-  version. Run `install.sh --shim` again after an update; it re-resolves the
-  binary and relinks.
+- The shim only routes launchers whose PATH has `~/.hydra/bin` ahead of the
+  real binary. Shells get that from `hydra.sh`; anything else needs it set
+  explicitly, and `hydra doctor` tells you when it is not.
 
 ## Tests
 
@@ -218,8 +243,9 @@ test/run.sh pick     # only tests whose name contains "pick"
 No dependencies beyond bash, jq and coreutils. Each test runs in a throwaway
 sandbox — its own `$HOME`, a fake `claude` and `curl` on `PATH`, a fixed clock
 (`HYDRA_NOW`) and file-based credentials (`HYDRA_NO_KEYCHAIN=1`) — so nothing
-touches your real profiles, Keychain or the network. CI runs the suite on
-macOS and Ubuntu.
+touches your real profiles, Keychain or the network. The shim tests install it
+into the sandbox and simulate Claude Code's updater rewriting the binary
+underneath it. CI runs the suite on macOS and Ubuntu.
 
 ## Credits
 

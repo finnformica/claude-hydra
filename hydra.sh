@@ -4,6 +4,17 @@
 #   claude [args…]           → freshest profile
 #   claude <profile> [args…] → that profile
 #   claude mcp|auth|update…  → untouched
+
+# The opt-in shim (install.sh --shim) lives in $HYDRA_HOME/bin, shadowing the
+# real binary rather than replacing it. Put that directory first on PATH so a
+# bare `claude` from anything this shell starts is routed too — and stays
+# routed after Claude Code's updater rewrites ~/.local/bin/claude.
+_hydra_bin="${HYDRA_HOME:-$HOME/.hydra}/bin"
+if [ -d "$_hydra_bin" ]; then
+  case ":$PATH:" in ":$_hydra_bin:"*) ;; *) PATH="$_hydra_bin:$PATH" ;; esac
+fi
+unset _hydra_bin
+
 claude() {
   if command -v hydra >/dev/null 2>&1; then
     hydra exec "$@"
@@ -28,6 +39,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
       'refresh:fetch usage now' 'pick:which profile a bare claude would use'
       'link:reapply shared-config symlinks' 'dir:print a config dir' 'exec:launch claude on a profile'
       'bin:the real claude binary hydra execs'
+      'doctor:check the shim and the real binary'
       'help:show help'
     )
     if (( CURRENT == 2 )); then
@@ -58,7 +70,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
 elif [ -n "${BASH_VERSION:-}" ]; then
   _hydra_bash() {
     local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
-    local cmds="add login remove rename enable disable list status refresh pick link dir exec bin help"
+    local cmds="add login remove rename enable disable list status refresh pick link dir exec bin doctor help"
     if [ "$COMP_CWORD" -eq 1 ]; then
       COMPREPLY=($(compgen -W "$cmds $(hydra names 2>/dev/null)" -- "$cur"))
     else
