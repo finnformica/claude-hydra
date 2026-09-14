@@ -166,8 +166,9 @@ it unset unless you need it — the default is the first `claude` on PATH that i
 not hydra's own shim, found at every launch. A pin that does not run on this
 machine is ignored.
 
-A disabled profile stays signed in and shows in `hydra status`, but is never
-auto-picked; `claude work` still launches it explicitly.
+A disabled profile stays signed in and shows in `hydra status` (its usage is
+still refreshed there, table and `--json` alike), but is never auto-picked;
+`claude work` still launches it explicitly.
 
 The choice is made once per launch. A running session is bound to one account
 and cannot hop; when it hits a limit, start a new `claude` and hydra routes you
