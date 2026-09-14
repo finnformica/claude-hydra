@@ -21,6 +21,9 @@ HYDRA_MANIFEST="${HYDRA_MANIFEST:-$HYDRA_HOME/profiles.json}"
 CACHE_DIR="$HYDRA_HOME/cache"
 PROFILES_DIR="$HYDRA_HOME/profiles"
 DEFAULT_DIR="$HOME/.claude"
+SHIM_DIR="$HYDRA_HOME/bin"          # install.sh --shim links the `claude` shim here
+SHIM="$SHIM_DIR/claude"
+LOCAL_BIN="${HYDRA_BIN_DIR:-$HOME/.local/bin}"   # where Claude Code's native installer puts `claude`
 
 USAGE_URL="https://api.anthropic.com/api/oauth/usage"
 MIN_REFRESH_S=180 # the usage endpoint rate-limits anything faster than this
@@ -31,7 +34,7 @@ SHARED_FILES="settings.json CLAUDE.md history.jsonl"
 
 # Claude's own subcommands: never routed unless a profile is named first.
 PASSTHROUGH="agents attach auth auto-mode doctor gateway import install logs mcp plugin plugins project respawn rm setup-token stop kill ultrareview update upgrade"
-HYDRA_CMDS="add login remove rm rename enable disable list ls names link status refresh pick dir has exec bin help"
+HYDRA_CMDS="add login remove rm rename enable disable list ls names link status refresh pick dir has exec bin doctor help"
 RESERVED="auto best $HYDRA_CMDS $PASSTHROUGH"
 
 # ---------------------------------------------------------------- utilities
@@ -65,6 +68,8 @@ sha8() {
 # ~ in the manifest keeps it portable between machines with different usernames.
 expand() { case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s%s' "$HOME" "${1#"~"}" ;; *) printf '%s' "$1" ;; esac; }
 contract() { case "$1" in "$HOME") printf '~' ;; "$HOME/"*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+# The same with $HOME, for a path quoted inside a shell command (~ would not expand there).
+shell_path() { case "$1" in "$HOME/"*) printf '$HOME%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
 
 now() { printf '%s' "${HYDRA_NOW:-$(date +%s)}"; }   # HYDRA_NOW: fixed clock for tests
 
@@ -140,10 +145,11 @@ run_claude() {
 # ---------------------------------------------------------------- the real claude
 
 # hydra never runs claude by name: with install.sh --shim, the `claude` on PATH
-# *is* hydra, so exec'ing the name would recurse. The real binary comes from
-# HYDRA_CLAUDE_BIN, else claude_bin in the manifest, else the first claude on
-# PATH that is not hydra's shim — always resolved through its symlinks so the
-# recorded path stays valid once the shim takes over the original one.
+# *is* hydra, so exec'ing the name would recurse. The real binary is found
+# afresh on every launch — the first claude on PATH that is not hydra's shim —
+# so that when Claude Code's updater swaps ~/.local/bin/claude for a new
+# version, hydra runs the new one without anybody re-running anything.
+# HYDRA_CLAUDE_BIN and claude_bin in the manifest are explicit overrides only.
 
 # Follows symlinks without readlink -f (absent on older macOS).
 real_path() {
@@ -170,19 +176,25 @@ find_claude_bin() {
   return 1
 }
 
+manifest_bin() { expand "$(manifest | jq -r '.claude_bin // empty')"; }
+
 CLAUDE_BIN=""
+CLAUDE_BIN_FROM=""   # which rule produced it: env, manifest or path (doctor reports it)
 claude_bin() {
   if [ -z "$CLAUDE_BIN" ]; then
     local b
     if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then
       b=$(usable_bin "$(expand "$HYDRA_CLAUDE_BIN")") ||
         die "HYDRA_CLAUDE_BIN=$HYDRA_CLAUDE_BIN is not a runnable claude (missing, not executable, or hydra's own shim)"
+      CLAUDE_BIN_FROM=env
+    elif b=$(usable_bin "$(manifest_bin)" 2>/dev/null); then
+      CLAUDE_BIN_FROM=manifest
     else
       # A manifest entry that no longer runs here (another machine, a pruned
       # version) falls back to PATH rather than blocking every launch.
-      b=$(usable_bin "$(expand "$(manifest | jq -r '.claude_bin // empty')")" 2>/dev/null) ||
-        b=$(find_claude_bin) ||
-        die "no claude binary on PATH apart from hydra's own shim — hydra bin PATH, HYDRA_CLAUDE_BIN, or install.sh --unshim"
+      b=$(find_claude_bin) ||
+        die "no claude binary on PATH apart from hydra's own shim — put Claude Code on PATH, or name it with HYDRA_CLAUDE_BIN (hydra doctor)"
+      CLAUDE_BIN_FROM=path
     fi
     CLAUDE_BIN="$b"
   fi
@@ -194,6 +206,108 @@ launch() {
   local bin; bin=$(claude_bin)
   HYDRA_LAUNCH_PID=$$; export HYDRA_LAUNCH_PID   # the shim's recursion tripwire
   exec -a claude "$bin" "$@"
+}
+
+# ---------------------------------------------------------------- doctor
+
+# The shim only helps while it shadows the real binary: $HYDRA_HOME/bin has to
+# come before wherever `claude` really lives on PATH. Nothing enforces that at
+# launch (a launcher that skips the shim never reaches hydra), so `doctor` and
+# `status` check it and say so.
+shim_installed() { [ -e "$SHIM" ] && is_shim "$SHIM"; }
+
+# The first executable called claude on PATH — what a direct launch runs.
+first_claude_on_path() {
+  local IFS=: d c
+  for d in $PATH; do
+    c="${d:-.}/claude"
+    [ -f "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+# Prints the claude a direct launch would run when that is not hydra's shim
+# (an empty line when there is none at all); succeeds only in that case.
+shim_bypassed_by() {
+  local first
+  shim_installed || return 1
+  first=$(first_claude_on_path) || { printf '\n'; return 0; }
+  is_shim "$first" && return 1
+  printf '%s\n' "$first"
+}
+
+# The layout install.sh --shim used before the shim moved to $HYDRA_HOME/bin:
+# the shim *in place of* ~/.local/bin/claude, the original kept beside it.
+old_shim_layout() { { [ -e "$LOCAL_BIN/claude" ] && is_shim "$LOCAL_BIN/claude"; } || [ -e "$LOCAL_BIN/claude.hydra-bak" ] || [ -L "$LOCAL_BIN/claude.hydra-bak" ]; }
+
+cmd_doctor() {
+  local rc=0 first cand from="" real msg version
+  ok()      { printf 'ok    %s\n' "$1"; }
+  note()    { printf '      %s\n' "$1"; }
+  problem() { rc=1; printf 'FAIL  %s\n      fix: %s\n' "$1" "$2"; }
+
+  # 1. is the shim installed where hydra.sh and the README put it — and only there?
+  if shim_installed; then
+    ok "shim installed: $(contract "$SHIM") -> $(readlink "$SHIM" 2>/dev/null || printf '(a copy)')"
+  elif ! old_shim_layout; then
+    problem "shim not installed at $(contract "$SHIM") — launchers that bypass the claude() shell function are not routed" \
+            "install.sh --shim"
+  fi
+  if old_shim_layout; then
+    problem "the old shim layout is still in place in $(contract "$LOCAL_BIN") (claude replaced by the shim, or claude.hydra-bak beside it) — Claude Code's updater overwrites it" \
+            "install.sh --shim   # migrates it to $(contract "$SHIM_DIR")"
+  fi
+
+  # 2. does the shim win a PATH search?
+  if shim_installed; then
+    if first=$(first_claude_on_path); then
+      if [ "$first" -ef "$SHIM" ]; then
+        ok "$(contract "$SHIM_DIR") comes first on PATH: a direct \`claude\` runs the shim"
+      elif is_shim "$first"; then
+        problem "$first (the old shim layout) comes before $(contract "$SHIM_DIR") on PATH" "install.sh --shim"
+      else
+        case ":$PATH:" in
+          *":$SHIM_DIR:"*) msg="$(contract "$SHIM_DIR") is on PATH but after $(dirname "$first")" ;;
+          *) msg="$(contract "$SHIM_DIR") is not on PATH" ;;
+        esac
+        problem "$msg: a direct \`claude\` runs $first and skips hydra" \
+                "put it first — exec \$SHELL (hydra.sh does it), or export PATH=\"$(shell_path "$SHIM_DIR"):\$PATH\" in the launcher's environment"
+      fi
+    else
+      problem "$(contract "$SHIM_DIR") is not on PATH (nor is any claude)" \
+              "export PATH=\"$(shell_path "$SHIM_DIR"):\$PATH\" — exec \$SHELL for a shell that sources hydra.sh"
+    fi
+  else
+    if first=$(first_claude_on_path); then note "a direct \`claude\` runs $first, unrouted"; fi
+  fi
+
+  # 3. which real binary hydra would exec right now, and that it is not the shim.
+  if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then cand=$(expand "$HYDRA_CLAUDE_BIN"); from="HYDRA_CLAUDE_BIN"
+  elif cand=$(manifest_bin) && [ -n "$cand" ]; then from="claude_bin in the manifest"; fi
+  if [ -n "$from" ] && [ -e "$cand" ] && is_shim "$cand"; then
+    problem "$from names hydra's own shim ($cand): every launch would recurse (the shim stops it with exit 70)" \
+            "$(if [ "$from" = HYDRA_CLAUDE_BIN ]; then printf 'unset HYDRA_CLAUDE_BIN'; else printf 'hydra bin --unset'; fi)"
+  elif real=$(claude_bin 2>&1); then
+    claude_bin >/dev/null   # again, in this shell, so CLAUDE_BIN_FROM is set (it cannot fail twice)
+    if is_shim "$real"; then
+      problem "the real claude resolves to hydra's own shim ($real): every launch would recurse" \
+              "unset HYDRA_CLAUDE_BIN; hydra bin --unset; install.sh --unshim if it persists"
+    else
+      version=$("$real" --version 2>/dev/null | awk '{print $1}' || true)
+      ok "real claude: $real${version:+ ($version)}, $(case "$CLAUDE_BIN_FROM" in env) printf 'pinned by HYDRA_CLAUDE_BIN' ;; manifest) printf 'pinned by claude_bin in the manifest' ;; *) printf 'found on PATH' ;; esac)"
+      if [ "$CLAUDE_BIN_FROM" != path ] && first=$(find_claude_bin) && [ "$first" != "$real" ]; then
+        note "PATH would give $first instead; the pin does not follow updates ($(if [ "$CLAUDE_BIN_FROM" = env ]; then printf 'unset HYDRA_CLAUDE_BIN'; else printf 'hydra bin --unset'; fi) to follow PATH)"
+      fi
+      if [ -n "$from" ] && [ "$CLAUDE_BIN_FROM" = path ]; then
+        note "$from ($cand) does not run on this machine and is ignored (hydra bin --unset to tidy it)"
+      fi
+    fi
+  else
+    problem "cannot resolve the real claude: ${real#hydra: }" \
+            "$(if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then printf 'unset HYDRA_CLAUDE_BIN, or point it at the real binary'; else printf 'install Claude Code and put it on PATH (hydra never runs its own shim)'; fi)"
+  fi
+
+  return "$rc"
 }
 
 # ---------------------------------------------------------------- model intent
@@ -552,6 +666,12 @@ cmd_status() {
   local cached=0 force=0 json=0
   while [ $# -gt 0 ]; do case "$1" in --cached) cached=1 ;; --force) force=1 ;; --json) json=1 ;; esac; shift; done
   [ "$(profile_count)" -gt 0 ] || die "no profiles yet — hydra add <name>"
+  # The one failure mode nothing else reports: the shim is in but a direct
+  # `claude` never reaches it. Always to stderr, terminal or not.
+  local winner
+  if winner=$(shim_bypassed_by); then
+    say "hydra: warning: the claude shim is installed but ${winner:-nothing} wins a PATH search, so direct launches skip hydra (hydra doctor)"
+  fi
   if [ "$cached" -eq 0 ]; then
     if [ "$force" -eq 1 ]; then refresh --force >/dev/null; else refresh --stale >/dev/null; fi
   fi
@@ -638,23 +758,25 @@ cmd_exec() {
   else export CLAUDE_CONFIG_DIR="$dir"; launch "$@"; fi
 }
 
-# hydra bin            the real claude hydra execs (resolved)
-# hydra bin PATH       record it in the manifest (install.sh --shim does this)
-# hydra bin --unset    forget it; PATH is walked again
+# hydra bin            the real claude hydra execs right now (resolved)
+# hydra bin PATH       pin one in the manifest — an override; it will not follow updates
+# hydra bin --unset    drop the pin; PATH is walked on every launch again (the default)
 cmd_bin() {
   case "${1:-}" in
     "") claude_bin; echo ;;
     --unset)
       if manifest | jq -e '.claude_bin != null' >/dev/null 2>&1; then
         manifest | jq 'del(.claude_bin)' | save_manifest
-      fi
-      say "claude_bin cleared — hydra runs the first claude on PATH that is not its shim" ;;
+        say "claude_bin cleared — hydra runs the first claude on PATH that is not its shim"
+      else
+        say "claude_bin is not set — hydra already runs the first claude on PATH that is not its shim"
+      fi ;;
     -*) die "usage: hydra bin [PATH | --unset]" ;;
     *)
       local real
       real=$(usable_bin "$(expand "$1")") || die "'$1' is not a runnable claude (missing, not executable, or hydra's own shim)"
       manifest | jq --arg b "$(contract "$real")" '.claude_bin = $b' | save_manifest
-      say "claude_bin → $(contract "$real")" ;;
+      say "claude_bin → $(contract "$real") (pinned: it will not follow Claude Code updates; hydra bin --unset to follow PATH)" ;;
   esac
 }
 
@@ -684,9 +806,11 @@ hydra — many heads, one Claude Code
                               what the `claude` shell function and the shim call
   hydra <profile> [claude args…]
                               shorthand for hydra exec <profile> …
-  hydra bin [PATH | --unset]  the real claude binary hydra execs; set or forget it
+  hydra bin [PATH | --unset]  the real claude binary hydra execs (found on PATH at every
+                              launch); pin one, or drop the pin
+  hydra doctor                check the shim: installed, first on PATH, and what it runs
 
-Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_CLAUDE_BIN (the real binary),
+Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_CLAUDE_BIN (pin the real binary),
              HYDRA_QUIET=1 (never print the routing hint; default: only on a terminal;
              HYDRA_QUIET=0 always), HYDRA_MODEL (score for this model when no --model is passed)
 EOF
@@ -709,6 +833,7 @@ case "${1:-help}" in
   has)     has_profile "${2:-}" ;;
   exec)    shift; cmd_exec "$@" ;;
   bin)     shift; cmd_bin "$@" ;;
+  doctor)  cmd_doctor ;;
   help|-h|--help) cmd_help ;;
   *) if has_profile "$1"; then cmd_exec "$@"; else die "unknown command '$1' (hydra help)"; fi ;;
 esac

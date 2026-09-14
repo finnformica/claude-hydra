@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # hydra-shim — stands in for the `claude` binary on PATH.
 #
-# install.sh --shim links ~/.local/bin/claude here so that every launcher —
-# an interactive shell, an editor, a script running `claude -p` — goes through
-# hydra's routing, not just the claude() shell function. hydra recognises this
-# file by the "hydra-shim" marker in its header and never execs it as the
-# real binary; it execs the real one by explicit path (hydra bin).
+# install.sh --shim links $HYDRA_HOME/bin/claude here and hydra.sh puts that
+# directory first on PATH, so that every launcher — an interactive shell, an
+# editor, a script running `claude -p` — goes through hydra's routing, not
+# just the claude() shell function. The real binary at ~/.local/bin/claude is
+# never touched: Claude Code's updater may rewrite it at will and hydra finds
+# the new one on the next launch. hydra recognises this file by the
+# "hydra-shim" marker in its header and never execs it as the real binary.
 set -eu
 
 # hydra execs the real claude with HYDRA_LAUNCH_PID set to its own pid, which
 # exec preserves. Landing back here with the same pid means the "real" binary
 # hydra resolved was this shim — stop instead of looping forever.
 if [ "${HYDRA_LAUNCH_PID:-}" = "$$" ]; then
-  printf 'hydra: the claude shim was launched recursively — claude_bin resolves to the shim itself (hydra bin PATH, or install.sh --unshim)\n' >&2
+  printf 'hydra: the claude shim was launched recursively — the real claude resolves to the shim itself (hydra doctor)\n' >&2
   exit 70
 fi
 

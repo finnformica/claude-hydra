@@ -16,15 +16,16 @@ the invariants that are easy to break.
 |---|---|
 | `hydra` | The whole CLI, one bash script. Sections in order: utilities, manifest, credentials, model intent, usage (fetch/snapshot/refresh/pick), linking, commands, dispatch. |
 | `hydra.sh` | Sourced by the user's rc file. Defines the `claude()` function (→ `hydra exec "$@"`) and zsh/bash tab completion. |
-| `claude-shim` | Opt-in stand-in for the `claude` binary on PATH (→ `hydra exec "$@"`), so launchers that bypass the shell function are routed too. Carries the `hydra-shim` marker in its header. |
-| `install.sh` | Symlinks `hydra` into `~/.local/bin`, appends the `source` line to `~/.zshrc`. `--shim` records the real binary and links `~/.local/bin/claude` to the shim; `--unshim` restores it. |
+| `claude-shim` | Opt-in stand-in for the `claude` binary on PATH (→ `hydra exec "$@"`), so launchers that bypass the shell function are routed too. Linked as `$HYDRA_HOME/bin/claude`, *ahead of* the real binary, never in its place. Carries the `hydra-shim` marker in its header. |
+| `install.sh` | Symlinks `hydra` into `~/.local/bin`, appends the `source` line to `~/.zshrc`. `--shim` links `$HYDRA_HOME/bin/claude` to the shim and adds a marked `export PATH=…` line to the rc; `--unshim` removes both. Both migrate the old in-place layout. |
 | `test/run.sh` | The test suite. TAP-style output, no dependencies beyond bash + jq. |
 | `.github/workflows/test.yml` | Runs the suite on macOS and Ubuntu. |
 
 Runtime state lives outside the repo in `$HYDRA_HOME` (default `~/.hydra`):
-`profiles.json` (the manifest — names, dirs, emails, tuning, `claude_bin`; no secrets),
-`cache/<name>.json` (usage snapshots), `profiles/<name>/` (each profile's
-`CLAUDE_CONFIG_DIR`). The default profile is `~/.claude` itself.
+`profiles.json` (the manifest — names, dirs, emails, tuning, an optional
+`claude_bin` pin; no secrets), `cache/<name>.json` (usage snapshots),
+`profiles/<name>/` (each profile's `CLAUDE_CONFIG_DIR`), and `bin/claude` (the
+shim, when installed). The default profile is `~/.claude` itself.
 
 ## Commands
 
@@ -72,17 +73,32 @@ with no data at all (first launch after sign-in).
 
 **hydra never runs `claude` by name.** With the shim installed, the `claude` on
 PATH *is* hydra, so `exec claude` (or `command claude`) would recurse. Every
-launch goes through `launch`/`run_claude`, which use `claude_bin`:
-`HYDRA_CLAUDE_BIN` → manifest `claude_bin` (if it runs here) → the first
-`claude` on PATH that `is_shim` rejects — `is_shim` matches the `hydra-shim`
-marker in the first 512 bytes, or hydra's own file (`-ef "$0"`). The result is
-symlink-resolved (`real_path`, no `readlink -f` — older macOS lacks it), because
-`install.sh --shim` records it *before* replacing the link it was found
-through. `launch` execs with `-a claude` so argv[0] is unchanged, and exports
-`HYDRA_LAUNCH_PID=$$`; the shim exits 70 if it is entered with that pid (exec
-keeps the pid), so a mis-resolved binary fails loudly rather than looping.
-The only `command claude` left is the shell function's fallback for when hydra
-is not on PATH, which cannot reach hydra and so cannot recurse.
+launch goes through `launch`/`run_claude`, which use `claude_bin`: the first
+`claude` on PATH that `is_shim` rejects (`find_claude_bin`) is the *default*,
+walked afresh on every launch; `HYDRA_CLAUDE_BIN`, then a manifest `claude_bin`
+(only if it runs here), are explicit pins that override it and nothing writes
+them but the user. `is_shim` matches the `hydra-shim` marker in the first 512
+bytes, or hydra's own file (`-ef "$0"`). The result is symlink-resolved
+(`real_path`, no `readlink -f` — older macOS lacks it). `launch` execs with
+`-a claude` so argv[0] is unchanged, and exports `HYDRA_LAUNCH_PID=$$`; the shim
+exits 70 if it is entered with that pid (exec keeps the pid), so a mis-resolved
+binary fails loudly rather than looping. The shell function's fallback
+`command claude` (hydra not on PATH) reaches at most the shim, which execs
+hydra by its own path, so it cannot recurse either.
+
+**The shim shadows the real binary; it never replaces it.** It is linked at
+`$HYDRA_HOME/bin/claude` and `hydra.sh` puts that directory first on PATH
+(when it exists; `install.sh --shim` also appends a line marked `# hydra-shim`
+to the rc). `~/.local/bin/claude` is never moved, so Claude Code's updater can
+rewrite it and the next launch simply finds the new binary. This is why
+`install.sh --shim` must not record `claude_bin`: a pin is exactly what went
+stale under the old layout. Nothing enforces the PATH order at launch — a
+launcher whose PATH lacks `$HYDRA_HOME/bin` never reaches hydra — so `doctor`
+(`shim_installed`, `first_claude_on_path`, `shim_bypassed_by`) and the one
+stderr warning in `status` are the only places that failure is visible. Keep
+them honest: `doctor` exits non-zero for every finding and prints a fix line.
+`doctor` is also a Claude subcommand: `hydra doctor` is ours, `claude doctor`
+still passes through.
 
 **The routing hint is for terminals only.** `hint` prints when stderr is a TTY
 (`[ -t 2 ]`); `HYDRA_QUIET=1` always silences it, `HYDRA_QUIET=0` always
@@ -128,12 +144,15 @@ changing the test under `# status:` too.
 `hydra <name>` and `claude <name>` dispatch on the first argument. Add new
 subcommands to `HYDRA_CMDS` *and* to the completion lists in `hydra.sh`.
 
-**The shim install is reversible and idempotent.** `install.sh --shim` moves
-whatever is at `$bin/claude` (file or symlink, even a dangling one) to
-`claude.hydra-bak` and links the shim; `--unshim` moves it back and clears
-`claude_bin`. A regular file there (a copied binary) is moved, never deleted,
-and `claude_bin` then points at the `.hydra-bak`. The record happens before the
-link, and the move is undone if the record fails.
+**The shim install is reversible and idempotent, and migrates the old layout.**
+Before the shadow layout, `--shim` put the shim *in place of* `$bin/claude`,
+kept the original as `claude.hydra-bak` and pinned `claude_bin`; the updater
+then overwrote the link and left the pin stale. `restore_old_layout` (run by
+both `--shim` and `--unshim`) puts `$bin/claude` back from the backup, removes
+an old shim with no backup, drops a stale backup when the updater has already
+put a real `claude` there (a symlink; a regular-file backup is only reported,
+never deleted), and clears `claude_bin` — printing each step, and nothing on a
+second run. `--shim` still refuses when no real binary resolves.
 
 ## The ranking, precisely
 
@@ -160,14 +179,19 @@ fake `claude` (records args; `auth login` writes fake credentials) and a fake
 `HYDRA_NO_KEYCHAIN=1` so credentials are files, and `HYDRA_NOW` for a fixed
 clock. `usage <5h> <weekly> <fable> [resets…]` builds an endpoint body;
 `set_usage <name> …` serves it and fetches it into the cache. Tests that read
-the hint from a pipe set `HYDRA_QUIET=0`. `shim_on` runs `install.sh --shim`
-into `$SB/lbin` and puts it first on PATH, so `bash -c 'claude …'` goes shim →
-hydra → the fake; `real` resolves a path the way `hydra bin` prints it
-(macOS's `/var` is `/private/var`); `with_tty` runs a command on a pty via
-`script(1)` (util-linux and BSD forms); `tool_path` builds a PATH with every
-tool hydra needs and no `claude` at all. New behaviour gets a test in the
-matching section; the suite must stay green on both CI platforms — Ubuntu has
-already caught a macOS-only assumption once.
+the hint from a pipe set `HYDRA_QUIET=0`. `fake_claude <path> <version>` writes
+the fake anywhere (an "update" is a second one with a new version);
+`native_layout` moves it to `$SB/real/claude` with `$SB/lbin/claude` linking
+to it — the macOS native install shape, `$SB/lbin` standing in for
+`~/.local/bin`; `shim_install` runs `install.sh` against `$SB/lbin` and
+`$SB/rc`; `shim_on` installs the shim and puts `$HYDRA_HOME/bin` first on
+PATH (what `hydra.sh` does), so `bash -c 'claude …'` goes shim → hydra → the
+fake; `shim` prints the shim's path; `real` resolves a path the way `hydra bin`
+prints it (macOS's `/var` is `/private/var`); `with_tty` runs a command on a
+pty via `script(1)` (util-linux and BSD forms); `tool_path` builds a PATH with
+every tool hydra needs and no `claude` at all. New behaviour gets a test in
+the matching section; the suite must stay green on both CI platforms — Ubuntu
+has already caught a macOS-only assumption once.
 
 ## Style
 
