@@ -40,7 +40,9 @@ command immediately (it is symlinked).
 
 **Portability.** The script must run on macOS's stock bash 3.2 and jq 1.6, and
 on Linux. So: no associative arrays, no `${var,,}`, no `mapfile`, no
-`readarray`; no jq features newer than 1.6 (`fromdateiso8601` needs the `ts`
+`readarray`; bracket ranges like `[a-z]` are locale-collated in bash 3.2 (they
+match capitals under `en_US.UTF-8`), so `valid_name` checks its character set
+through `LC_ALL=C tr`; no jq features newer than 1.6 (`fromdateiso8601` needs the `ts`
 helper because it rejects fractional seconds and `+00:00`). `exec claude`, not
 `exec command claude` — bash cannot exec a builtin, and macOS only hid that
 behind its `/usr/bin/command` shim (CI caught it).
@@ -94,6 +96,12 @@ if missing so the link always resolves; files are linked only if they exist.
 `.claude.json`, `history.jsonl`-style per-session state, `sessions/` and the
 credentials are never shared. `link_shared` is idempotent and repairs wrong
 targets; it replaces a real file only with `--force` (keeping a `.hydra-bak`).
+
+**The STATE column and `status --json` share one rule.** `state($threshold)` in
+`JQ_LIB` is the only place that decides `ok` / `exhausted` / `locked` / …; the
+table and the JSON both call it, and `--json` is `snapshots` plus that field,
+nothing re-derived. Orca reads the JSON strings verbatim, so changing one means
+changing the test under `# status:` too.
 
 **Reserved names.** A profile name may not collide with a hydra subcommand
 (`HYDRA_CMDS`), a Claude subcommand (`PASSTHROUGH`), or `auto`/`best`, because
