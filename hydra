@@ -282,11 +282,12 @@ cmd_doctor() {
   fi
 
   # 3. which real binary hydra would exec right now, and that it is not the shim.
-  if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then cand=$(expand "$HYDRA_CLAUDE_BIN"); from="HYDRA_CLAUDE_BIN"
+  # (Plain case/if statements, not inside $(...): bash 3.2 cannot parse those.)
+  local unpin="hydra bin --unset" how
+  if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then cand=$(expand "$HYDRA_CLAUDE_BIN"); from="HYDRA_CLAUDE_BIN"; unpin="unset HYDRA_CLAUDE_BIN"
   elif cand=$(manifest_bin) && [ -n "$cand" ]; then from="claude_bin in the manifest"; fi
   if [ -n "$from" ] && [ -e "$cand" ] && is_shim "$cand"; then
-    problem "$from names hydra's own shim ($cand): every launch would recurse (the shim stops it with exit 70)" \
-            "$(if [ "$from" = HYDRA_CLAUDE_BIN ]; then printf 'unset HYDRA_CLAUDE_BIN'; else printf 'hydra bin --unset'; fi)"
+    problem "$from names hydra's own shim ($cand): every launch would recurse (the shim stops it with exit 70)" "$unpin"
   elif real=$(claude_bin 2>&1); then
     claude_bin >/dev/null   # again, in this shell, so CLAUDE_BIN_FROM is set (it cannot fail twice)
     if is_shim "$real"; then
@@ -294,17 +295,23 @@ cmd_doctor() {
               "unset HYDRA_CLAUDE_BIN; hydra bin --unset; install.sh --unshim if it persists"
     else
       version=$("$real" --version 2>/dev/null | awk '{print $1}' || true)
-      ok "real claude: $real${version:+ ($version)}, $(case "$CLAUDE_BIN_FROM" in env) printf 'pinned by HYDRA_CLAUDE_BIN' ;; manifest) printf 'pinned by claude_bin in the manifest' ;; *) printf 'found on PATH' ;; esac)"
+      case "$CLAUDE_BIN_FROM" in
+        env) how="pinned by HYDRA_CLAUDE_BIN" ;;
+        manifest) how="pinned by claude_bin in the manifest" ;;
+        *) how="found on PATH" ;;
+      esac
+      ok "real claude: $real${version:+ ($version)}, $how"
       if [ "$CLAUDE_BIN_FROM" != path ] && first=$(find_claude_bin) && [ "$first" != "$real" ]; then
-        note "PATH would give $first instead; the pin does not follow updates ($(if [ "$CLAUDE_BIN_FROM" = env ]; then printf 'unset HYDRA_CLAUDE_BIN'; else printf 'hydra bin --unset'; fi) to follow PATH)"
+        note "PATH would give $first instead; the pin does not follow updates ($unpin to follow PATH)"
       fi
       if [ -n "$from" ] && [ "$CLAUDE_BIN_FROM" = path ]; then
         note "$from ($cand) does not run on this machine and is ignored (hydra bin --unset to tidy it)"
       fi
     fi
   else
-    problem "cannot resolve the real claude: ${real#hydra: }" \
-            "$(if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then printf 'unset HYDRA_CLAUDE_BIN, or point it at the real binary'; else printf 'install Claude Code and put it on PATH (hydra never runs its own shim)'; fi)"
+    if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then how="unset HYDRA_CLAUDE_BIN, or point it at the real binary"
+    else how="install Claude Code and put it on PATH (hydra never runs its own shim)"; fi
+    problem "cannot resolve the real claude: ${real#hydra: }" "$how"
   fi
 
   return "$rc"
