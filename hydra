@@ -454,7 +454,10 @@ refresh() {
   while [ $# -gt 0 ]; do
     case "$1" in --force) force=1 ;; --stale) ;; *) names="$names $1" ;; esac; shift
   done
-  [ -n "$names" ] || names=$(enabled_names | tr '\n' ' ')
+  # Bare `refresh` covers every profile, disabled ones included: it is "fetch
+  # usage now", and status shows the disabled rows. Only the launch path narrows
+  # to the profiles it could pick, by naming them.
+  [ -n "$names" ] || names=$(profile_names | tr '\n' ' ')
   t=$(now)
   CLAUDE_VERSION=$(claude_version); export CLAUDE_VERSION
   for n in $names; do
