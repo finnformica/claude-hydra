@@ -80,9 +80,14 @@ Environment=PATH=%h/.hydra/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 `hydra doctor` reports whether the shim is installed, whether `~/.hydra/bin`
 comes before the directory holding the real binary on PATH, which binary hydra
 would exec right now and that it is not the shim itself; it exits non-zero with
-a one-line fix for anything wrong. `hydra status` also prints one warning line
-on stderr when the shim is installed but a direct `claude` would bypass it, so
-the silent case is never silent. `install.sh --unshim` removes the shim and the
+a one-line fix for anything wrong. It also knows whether the shell it runs in
+has sourced `hydra.sh` at all (`hydra.sh` exports `HYDRA_SOURCED=1`): a
+terminal opened before `install.sh` edited your rc has neither the `claude()`
+function nor `~/.hydra/bin` on PATH, so `claude` there is the plain binary,
+and `doctor` says "reload the shell" rather than describing the PATH.
+`hydra status` also prints one warning line on stderr when the shim is
+installed but a direct `claude` would bypass it, so the silent case is never
+silent. `install.sh --unshim` removes the shim and the
 PATH line; both directions are idempotent, and `--shim` migrates a machine that
 used the previous layout (the shim in place of `~/.local/bin/claude`, with a
 `claude.hydra-bak` beside it), restoring the original and printing what it did.
