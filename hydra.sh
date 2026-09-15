@@ -15,6 +15,18 @@ if [ -d "$_hydra_bin" ]; then
 fi
 unset _hydra_bin
 
+# Tells `hydra doctor` and `hydra status` that this shell (or an ancestor) has
+# run this file. A terminal opened before install.sh appended its lines to the
+# rc has neither the claude() function nor $HYDRA_HOME/bin on PATH, and the
+# only symptom is that `claude` quietly runs the real binary; the marker lets
+# doctor say "reload the shell" instead of just describing the PATH.
+export HYDRA_SOURCED=1
+
+# Claude Code's own installers have written `alias claude=…` to the rc in the
+# past. In zsh an alias beats a function of the same name, and an alias in
+# scope while this function is being *defined* would even rename it.
+unalias claude 2>/dev/null
+
 claude() {
   if command -v hydra >/dev/null 2>&1; then
     hydra exec "$@"

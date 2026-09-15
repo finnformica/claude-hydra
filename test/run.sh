@@ -43,6 +43,7 @@ sandbox() {
   SB="$TMP/sb$N$RANDOM"
   mkdir -p "$SB/home/.claude/skills" "$SB/bin" "$SB/home/.hydra"
   export HOME="$SB/home" HYDRA_HOME="$SB/home/.hydra" HYDRA_NO_KEYCHAIN=1 HYDRA_QUIET=1 HYDRA_NOW=$NOW
+  export HYDRA_SOURCED=1   # what hydra.sh sets: the sandbox stands in for a shell that has sourced it
   unset HYDRA_MANIFEST HYDRA_MODEL CLAUDE_CONFIG_DIR
   export FAKE_LOG="$SB/fake.log" FAKE_CURL_CODE=200 FAKE_CURL_EXIT=0 FAKE_CURL_BODY="$SB/usage.json" FAKE_EMAIL="who@example.com"
   usage 0 0 0 >"$FAKE_CURL_BODY"
@@ -672,6 +673,8 @@ if test "shim: install.sh --shim shadows ~/.local/bin/claude and never touches i
   assert_eq "hydra.sh puts the shim first on PATH" "$(shim)" "$(bash -c "source '$ROOT/hydra.sh'; type -P claude")"
   assert_contains "…so even \`command claude\` is routed" "dir=$HYDRA_HOME/profiles/w" "$(bash -c "source '$ROOT/hydra.sh'; command claude -p hi")"
   assert_eq "…without duplicating it" "1" "$(bash -c "source '$ROOT/hydra.sh'; source '$ROOT/hydra.sh'; printf '%s' \"\$PATH\"" | tr ':' '\n' | grep -c "^$HYDRA_HOME/bin\$")"
+  assert_eq "…and marks the shell as sourced, for doctor" "1" "$(env -u HYDRA_SOURCED bash -c "source '$ROOT/hydra.sh'; printf '%s' \"\${HYDRA_SOURCED:-}\"")"
+  assert_contains "…and an installer's \`alias claude=…\` does not shadow the function" "dir=$HYDRA_HOME/profiles/w" "$(bash -c "shopt -s expand_aliases; alias claude='$SB/lbin/claude'; source '$ROOT/hydra.sh'; claude -p hi")"
   assert_contains "…and the function falls back to the shim when hydra is not on PATH" "dir=$HYDRA_HOME/profiles/w" "$(PATH="$SB/lbin:$SB/bin:/usr/bin:/bin" bash -c "rm -f '$SB/lbin/hydra'; source '$ROOT/hydra.sh'; claude -p hi")"
   out=$(shim_install --shim)
   assert_contains "--shim again is a no-op" "shim already installed at $(shim)" "$out"
@@ -817,6 +820,32 @@ if test "doctor: fails when the real binary's dir precedes \$HYDRA_HOME/bin on P
   export PATH="$HYDRA_HOME/bin:$SB/lbin:$SB/bin:$ORIG_PATH"
   assert_ok "first again: passes" "$HYDRA" doctor
   assert_eq "…and status is quiet" "" "$("$HYDRA" status --cached 2>&1 >/dev/null)"
+fi
+
+if test "doctor: a shell that never sourced hydra.sh is told to reload"; then
+  native_layout
+  add w; set_usage w 0 0 0
+  shim_install --shim >/dev/null          # the rc is edited, but this shell predates it
+  out=$(env -u HYDRA_SOURCED "$HYDRA" doctor); rc=$?
+  assert_eq "exit 1" "1" "$rc"
+  assert_contains "names the missing source" "FAIL  ~/.hydra/bin is not on PATH and hydra.sh is not sourced in this shell: \`claude\` runs $SB/lbin/claude unrouted, and there is no claude() function to catch it" "$out"
+  assert_contains "…and the fix is to reload" 'fix: exec $SHELL, or open a new terminal — this shell predates the lines install.sh added to your rc' "$out"
+  err=$(env -u HYDRA_SOURCED "$HYDRA" status --cached 2>&1 >/dev/null)
+  assert_contains "status says the same" "hydra: warning: hydra.sh is not sourced in this shell and $SB/lbin/claude wins a PATH search, so nothing here is routed — exec \$SHELL (hydra doctor)" "$err"
+  assert_eq "…one line" "1" "$(printf '%s\n' "$err" | wc -l | tr -d ' ')"
+  out=$(env -u HYDRA_SOURCED PATH="$HYDRA_HOME/bin:$PATH" "$HYDRA" doctor); rc=$?
+  assert_eq "a launcher whose PATH has the shim first needs no rc: exit 0" "0" "$rc"
+  assert_not_contains "…no finding" "FAIL" "$out"
+  assert_eq "…and status is quiet" "" "$(env -u HYDRA_SOURCED PATH="$HYDRA_HOME/bin:$PATH" "$HYDRA" status --cached 2>&1 >/dev/null)"
+  shim_install --unshim >/dev/null
+  out=$(env -u HYDRA_SOURCED "$HYDRA" doctor); rc=$?
+  assert_eq "no shim and no source: exit 1" "1" "$rc"
+  assert_contains "…the shell function was the only routing and it is missing" "FAIL  hydra.sh is not sourced in this shell and no shim is installed: \`claude\` runs $SB/lbin/claude unrouted" "$out"
+  assert_contains "…reload first, shim as the next step" 'fix: exec $SHELL, or open a new terminal — this shell predates the lines install.sh added to your rc; install.sh --shim to route launchers that skip the rc too' "$out"
+  out=$("$HYDRA" doctor); rc=$?
+  assert_eq "sourced, no shim: the shim is the only finding" "1" "$rc"
+  assert_not_contains "…not the source" "not sourced" "$out"
+  assert_contains "…just the note" "a direct \`claude\` runs $SB/lbin/claude, unrouted" "$out"
 fi
 
 if test "doctor: fails when the shim is missing"; then

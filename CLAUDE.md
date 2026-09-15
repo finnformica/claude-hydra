@@ -97,6 +97,11 @@ launcher whose PATH lacks `$HYDRA_HOME/bin` never reaches hydra — so `doctor`
 (`shim_installed`, `first_claude_on_path`, `shim_bypassed_by`) and the one
 stderr warning in `status` are the only places that failure is visible. Keep
 them honest: `doctor` exits non-zero for every finding and prints a fix line.
+`hydra.sh` exports `HYDRA_SOURCED=1` (and `unalias claude`s first, since an
+alias beats a function in zsh); `rc_sourced` is how `doctor` and the `status`
+warning tell "this shell never ran the rc lines: reload it" from "the PATH is
+wrong". The test sandbox sets the marker, standing in for a sourced shell;
+tests for the unsourced case use `env -u HYDRA_SOURCED`.
 `doctor` is also a Claude subcommand: `hydra doctor` is ours, `claude doctor`
 still passes through.
 
