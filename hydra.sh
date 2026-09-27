@@ -52,6 +52,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
       'link:reapply shared-config symlinks' 'dir:print a config dir' 'exec:launch claude on a profile'
       'bin:the real claude binary hydra execs'
       'doctor:check the shim and the real binary'
+      'update:pull the latest hydra into its checkout'
       'help:show help'
     )
     if (( CURRENT == 2 )); then
@@ -82,7 +83,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
 elif [ -n "${BASH_VERSION:-}" ]; then
   _hydra_bash() {
     local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
-    local cmds="add login remove rename enable disable list status refresh pick link dir exec bin doctor help"
+    local cmds="add login remove rename enable disable list status refresh pick link dir exec bin doctor update help"
     if [ "$COMP_CWORD" -eq 1 ]; then
       COMPREPLY=($(compgen -W "$cmds $(hydra names 2>/dev/null)" -- "$cur"))
     else

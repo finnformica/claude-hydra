@@ -52,14 +52,31 @@ sandbox() {
 
   fake_claude "$SB/bin/claude" 9.9.9
   # Fake curl: copies FAKE_CURL_BODY to -o, prints FAKE_CURL_CODE, logs its args.
+  # A request to the sessions endpoint answers per bearer token instead, from
+  # FAKE_SESSIONS ("<token> <code>" lines; a token not listed gets 404), so one
+  # profile can own a session while another cannot see it.
   cat >"$SB/bin/curl" <<'EOF'
 #!/bin/sh
 printf 'curl %s\n' "$*" >>"$FAKE_LOG"
-out=""
-while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; esac; shift; done
+out="" url="" tok=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    -H) case "$2" in "Authorization: Bearer "*) tok="${2#Authorization: Bearer }" ;; esac; shift ;;
+    -m|-w) shift ;;
+    -*) ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
 [ "$FAKE_CURL_EXIT" = 0 ] || exit "$FAKE_CURL_EXIT"
 cp "$FAKE_CURL_BODY" "$out"
-printf '%s' "$FAKE_CURL_CODE"
+case "$url" in
+  */v1/code/sessions/*)
+    code=$(awk -v t="$tok" '$1 == t {print $2}' "${FAKE_SESSIONS:-/dev/null}" 2>/dev/null)
+    printf '%s' "${code:-404}" ;;
+  *) printf '%s' "$FAKE_CURL_CODE" ;;
+esac
 EOF
   chmod +x "$SB/bin/curl"
   export PATH="$SB/bin:$ORIG_PATH"
@@ -107,6 +124,14 @@ add() { local n=$1 e=${2:-$1@example.com}; shift; shift 2>/dev/null || true; FAK
 set_usage() { local n=$1; shift; usage "$@" >"$SB/u-$n.json"; FAKE_CURL_BODY="$SB/u-$n.json" "$HYDRA" refresh --force "$n" >/dev/null; }
 
 cache() { cat "$HYDRA_HOME/cache/$1.json"; }
+
+# sessions <name>=<code>…: what the sessions endpoint answers each profile's token (others get 404)
+sessions() {
+  local kv; : >"$SB/sessions"
+  for kv in "$@"; do printf 'tok-%s@example.com %s\n' "${kv%%=*}" "${kv#*=}" >>"$SB/sessions"; done
+  export FAKE_SESSIONS="$SB/sessions"
+}
+probes() { grep -c '/v1/code/sessions/' "$FAKE_LOG" 2>/dev/null | tr -d ' '; }   # how many profiles were asked
 real() { printf '%s/%s' "$(cd "$(dirname "$1")" && pwd -P)" "$(basename "$1")"; }   # what hydra bin prints (macOS: /var → /private/var)
 
 # shim_install: install.sh with $SB/lbin standing in for ~/.local/bin and $SB/rc for the shell rc.
@@ -531,6 +556,137 @@ if test "exec: the routing hint only goes to a terminal"; then
     assert_not_contains "HYDRA_QUIET=1 silences a terminal too" "hydra" "$(with_tty "HYDRA_QUIET=1 '$HYDRA' exec -p hi >/dev/null")"
   else
     skip "a terminal still gets it" "no script(1) to allocate a pty"
+  fi
+fi
+
+# ---------------------------------------------------------------- teleport
+
+if test "teleport: routes to the profile that owns the session, not the one with headroom"; then
+  add a; add b; set_usage a 0 0 0; set_usage b 80 80 80
+  sessions a=404 b=200; : >"$FAKE_LOG"
+  out=$(HYDRA_QUIET=0 "$HYDRA" exec --teleport session_01abc 2>&1)
+  assert_contains "launched on b" "dir=$HYDRA_HOME/profiles/b" "$out"
+  assert_contains "the argument is passed through" "arg=[session_01abc]" "$out"
+  assert_contains "the hint says why" "hydra → b   owns session_01abc" "$out"
+  assert_eq "a (best headroom) was asked first, b second" "2" "$(probes)"
+  assert_contains "asked the sessions endpoint with the id" "/v1/code/sessions/session_01abc" "$(cat "$FAKE_LOG")"
+  assert_contains "…with a's token" "Bearer tok-a@example.com" "$(cat "$FAKE_LOG")"
+  assert_contains "…with b's token" "Bearer tok-b@example.com" "$(cat "$FAKE_LOG")"
+  assert_contains "…as Claude Code does" "anthropic-version: 2023-06-01" "$(cat "$FAKE_LOG")"
+  assert_eq "the pick alone would have chosen a" "a" "$(pick)"
+fi
+
+if test "teleport: stops asking once the owner is found"; then
+  add a; add b; add c; set_usage a 0 0 0; set_usage b 1 0 0; set_usage c 2 0 0
+  sessions a=200; : >"$FAKE_LOG"
+  assert_contains "a" "dir=$HYDRA_HOME/profiles/a" "$("$HYDRA" exec --teleport session_x)"
+  assert_eq "one probe" "1" "$(probes)"
+fi
+
+if test "teleport: accepts the web UI's URL forms and --teleport=id"; then
+  add a; add b; set_usage a 0 0 0; set_usage b 0 0 0
+  sessions b=200
+  for form in "https://claude.ai/code/session_01abc" "https://claude.ai/code/session_01abc?tab=files" \
+              "claude.ai/code/session_01abc" "https://claude.ai/code/session_01abc/"; do
+    : >"$FAKE_LOG"
+    out=$("$HYDRA" exec --teleport "$form")
+    assert_contains "$form → b" "dir=$HYDRA_HOME/profiles/b" "$out"
+    assert_contains "$form: probed with the bare id" "/v1/code/sessions/session_01abc " "$(cat "$FAKE_LOG")"
+    assert_contains "$form: passed to claude untouched" "arg=[$form]" "$out"
+  done
+  : >"$FAKE_LOG"
+  out=$("$HYDRA" exec --model opus --teleport=session_01abc)
+  assert_contains "--teleport=id → b" "dir=$HYDRA_HOME/profiles/b" "$out"
+  assert_contains "--teleport=id: passed through" "arg=[--teleport=session_01abc]" "$out"
+  assert_contains "cse_ ids work too" "/v1/code/sessions/cse_9 " "$("$HYDRA" exec --teleport cse_9 >/dev/null; cat "$FAKE_LOG")"
+fi
+
+if test "teleport: a disabled profile is asked, and launched when it owns the session"; then
+  add a; add w; set_usage a 0 0 0; set_usage w 0 0 0
+  "$HYDRA" disable w >/dev/null 2>&1
+  sessions w=200
+  out=$(HYDRA_QUIET=0 "$HYDRA" exec --teleport session_x 2>&1)
+  assert_contains "launched on w" "dir=$HYDRA_HOME/profiles/w" "$out"
+  assert_contains "the hint says it is disabled" "owns session_x (disabled" "$out"
+  assert_eq "a still wins a plain launch" "a" "$(pick)"
+fi
+
+if test "teleport: an exhausted owner still wins"; then
+  add a; add b; set_usage a 95 95 95; set_usage b 0 0 0
+  sessions a=200
+  assert_contains "a" "dir=$HYDRA_HOME/profiles/a" "$("$HYDRA" exec --teleport session_x)"
+fi
+
+if test "teleport: nobody can see the session → no launch, every profile named"; then
+  add a; add b; set_usage a 0 0 0; set_usage b 0 0 0
+  sessions; : >"$FAKE_LOG"
+  out=$("$HYDRA" exec --teleport session_nope 2>&1); rc=$?
+  assert_eq "exits non-zero" "1" "$rc"
+  assert_contains "says so" "no profile on this machine can see session_nope" "$out"
+  assert_contains "names a" "a: not found" "$out"
+  assert_contains "names b" "b: not found" "$out"
+  assert_eq "claude was not launched" "0" "$(grep -c '^claude --teleport' "$FAKE_LOG" | tr -d ' ')"
+  assert_eq "dies even when stderr is not a terminal" "1" "$(HYDRA_QUIET=1 "$HYDRA" exec --teleport session_nope 2>&1 | grep -c 'no profile')"
+fi
+
+if test "teleport: a stale token or no network leaves the question to Claude Code"; then
+  add a; add b; add c; set_usage a 0 0 0; set_usage b 1 0 0; set_usage c 2 0 0
+  sessions a=404 b=401 c=200
+  out=$(HYDRA_QUIET=0 "$HYDRA" exec --teleport session_x 2>&1)
+  assert_contains "c owns it: c" "dir=$HYDRA_HOME/profiles/c" "$out"
+  sessions a=404 b=401 c=404
+  out=$(HYDRA_QUIET=0 "$HYDRA" exec --teleport session_x 2>&1)
+  assert_contains "only b is undecided: b" "dir=$HYDRA_HOME/profiles/b" "$out"
+  assert_contains "the hint says the owner is unknown" "could not tell who owns session_x" "$out"
+  assert_contains "…and why" "b: token stale" "$out"
+  out=$(HYDRA_QUIET=0 FAKE_CURL_EXIT=7 "$HYDRA" exec --teleport session_x 2>&1)
+  assert_contains "offline: the ordinary pick (a)" "dir=$HYDRA_HOME/profiles/a" "$out"
+  assert_contains "offline: says so" "a: offline" "$out"
+fi
+
+if test "teleport: a named profile, or --teleport alone, is not probed"; then
+  add a; add b; set_usage a 0 0 0; set_usage b 0 0 0
+  sessions b=200; : >"$FAKE_LOG"
+  assert_contains "claude a --teleport id → a regardless" "dir=$HYDRA_HOME/profiles/a" "$("$HYDRA" exec a --teleport session_x)"
+  assert_eq "no probe" "0" "$(probes)"
+  assert_contains "--teleport alone (the picker) → the ordinary pick" "dir=$HYDRA_HOME/profiles/a" "$("$HYDRA" exec --teleport)"
+  assert_contains "--teleport followed by a flag → the ordinary pick" "dir=$HYDRA_HOME/profiles/a" "$("$HYDRA" exec --teleport --model opus)"
+  assert_contains "an id that cannot go in a URL → the ordinary pick" "dir=$HYDRA_HOME/profiles/a" "$("$HYDRA" exec --teleport 'bad id!')"
+  assert_contains "-p text mentioning --teleport is just text" "dir=$HYDRA_HOME/profiles/a" "$("$HYDRA" exec -p 'run --teleport session_x')"
+  assert_eq "still no probe" "0" "$(probes)"
+fi
+
+# ---------------------------------------------------------------- update
+
+if test "update: fast-forwards the checkout hydra is linked from"; then
+  if ! command -v git >/dev/null 2>&1; then skip "update" "no git"; else
+    commit() { git -C "$1" add -A && git -C "$1" -c user.name=t -c user.email=t@example.com commit -qm "$2"; }
+    git init -q "$SB/origin" && cp "$ROOT/hydra" "$ROOT/hydra.sh" "$ROOT/claude-shim" "$ROOT/install.sh" "$SB/origin/" && commit "$SB/origin" "v1"
+    git clone -q "$SB/origin" "$SB/clone"
+    mkdir -p "$SB/lbin"; ln -s "$SB/clone/hydra" "$SB/lbin/hydra"
+    out=$("$SB/lbin/hydra" update 2>&1); rc=$?
+    assert_eq "nothing to pull: exit 0" "0" "$rc"
+    assert_contains "…and says so" "up to date" "$out"
+    printf '# a comment\n' >>"$SB/origin/hydra.sh"; commit "$SB/origin" "hydra.sh: tweak"
+    printf '# another\n' >>"$SB/origin/hydra"; commit "$SB/origin" "hydra: tweak"
+    out=$("$SB/lbin/hydra" update 2>&1); rc=$?
+    assert_eq "pulled: exit 0" "0" "$rc"
+    assert_eq "the clone is at origin's head" "$(git -C "$SB/origin" rev-parse HEAD)" "$(git -C "$SB/clone" rev-parse HEAD)"
+    assert_contains "lists what came in (1)" "hydra.sh: tweak" "$out"
+    assert_contains "lists what came in (2)" "hydra: tweak" "$out"
+    assert_contains "hydra.sh changed: reload advice" 'exec $SHELL' "$out"
+    printf '# more\n' >>"$SB/origin/hydra"; commit "$SB/origin" "hydra only"
+    out=$("$SB/lbin/hydra" update 2>&1)
+    assert_not_contains "hydra.sh unchanged: no reload advice" 'exec $SHELL' "$out"
+    printf '# local\n' >>"$SB/clone/hydra"
+    out=$("$SB/lbin/hydra" update 2>&1); rc=$?
+    assert_eq "local changes: refuses" "1" "$rc"
+    assert_contains "…and explains" "local changes" "$out"
+    mkdir -p "$SB/copy"; cp "$ROOT/hydra" "$SB/copy/hydra"
+    out=$("$SB/copy/hydra" update 2>&1); rc=$?
+    assert_eq "not a checkout: refuses" "1" "$rc"
+    assert_contains "…and explains" "not a git checkout" "$out"
+    assert_eq "update is a reserved profile name" "1" "$("$HYDRA" add update --no-login >/dev/null 2>&1; echo $?)"
   fi
 fi
 

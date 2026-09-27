@@ -14,7 +14,7 @@ the invariants that are easy to break.
 
 | File | Role |
 |---|---|
-| `hydra` | The whole CLI, one bash script. Sections in order: utilities, manifest, credentials, model intent, usage (fetch/snapshot/refresh/pick), linking, commands, dispatch. |
+| `hydra` | The whole CLI, one bash script. Sections in order: utilities, manifest, credentials, model intent, usage (fetch/snapshot/refresh/rank/pick), teleport, linking, commands, dispatch. |
 | `hydra.sh` | Sourced by the user's rc file. Defines the `claude()` function (→ `hydra exec "$@"`) and zsh/bash tab completion. |
 | `claude-shim` | Opt-in stand-in for the `claude` binary on PATH (→ `hydra exec "$@"`), so launchers that bypass the shell function are routed too. Linked as `$HYDRA_HOME/bin/claude`, *ahead of* the real binary, never in its place. Carries the `hydra-shim` marker in its header. |
 | `install.sh` | Symlinks `hydra` into `~/.local/bin`, appends the `source` line to `~/.zshrc`. `--shim` links `$HYDRA_HOME/bin/claude` to the shim and adds a marked `export PATH=…` line to the rc; `--unshim` removes both. Both migrate the old in-place layout. |
@@ -69,7 +69,28 @@ committed. The manifest is designed to be shareable via dotfiles.
 **Launch never waits on the network.** `cmd_exec` picks from cached numbers and
 `exec`s; a stale cache is refreshed by a detached `( "$0" refresh … & )` after
 the pick. The only synchronous fetch is `ensure_usage`, for a signed-in profile
-with no data at all (first launch after sign-in).
+with no data at all (first launch after sign-in). The one deliberate exception
+is a teleport, below.
+
+**A teleport is routed on ownership, not headroom.** A claude.ai/code session
+is visible only to the account that created it, and Claude Code resolves
+`--teleport <id>` with exactly one request, `GET
+https://api.anthropic.com/v1/code/sessions/<id>` with `Authorization: Bearer`
+and `anthropic-version: 2023-06-01` (found by reading the binary: a 404 is what
+it prints as "Session not found", a 401 "Session expired"). When a bare launch
+carries an id (`teleport_id`: `--teleport <v>` or `--teleport=<v>`, the value
+reduced to its last path component with any query string dropped, so the web
+UI's URL and the bare id are the same; anything outside `[A-Za-z0-9_-]` or a
+bare `--teleport` yields nothing and the ordinary pick runs), `teleport_route`
+probes every signed-in profile in `rank_json … --all` order — disabled ones
+last but included, since nothing else can teleport their sessions — and stops
+at the first 200. No 200: the best-ranked profile whose answer was not 404
+(401, offline, anything undecided) is launched and the hint says why, because
+Claude Code will refresh a stale token and answer for itself. Every profile
+404: `die`, naming them; nothing is launched. A named profile skips the probe.
+The endpoint is undocumented like the usage one, but the probe is one request
+per profile per teleport, so no rate-limit floor applies. `PASSTHROUGH` is
+untouched: `--teleport` is a flag, not a subcommand.
 
 **hydra never runs `claude` by name.** With the shim installed, the `claude` on
 PATH *is* hydra, so `exec claude` (or `command claude`) would recurse. Every
@@ -148,6 +169,14 @@ changing the test under `# status:` too.
 (`HYDRA_CMDS`), a Claude subcommand (`PASSTHROUGH`), or `auto`/`best`, because
 `hydra <name>` and `claude <name>` dispatch on the first argument. Add new
 subcommands to `HYDRA_CMDS` *and* to the completion lists in `hydra.sh`.
+`update` is in both lists on purpose, like `doctor`: `hydra update` is ours,
+`claude update` still reaches Claude Code's updater.
+
+**`hydra update` is a fast-forward pull of the checkout `$0` resolves into.**
+Because `~/.local/bin/hydra` and the shim are symlinks into the clone, the pull
+is the whole update; the command refuses on local changes, a detached HEAD or
+a copy that is not a checkout, and only tells the user to reload the shell when
+`hydra.sh` itself changed. It never touches `$HYDRA_HOME`.
 
 **The shim install is reversible and idempotent, and migrates the old layout.**
 Before the shadow layout, `--shim` put the shim *in place of* `$bin/claude`,
@@ -161,7 +190,9 @@ second run. `--shim` still refuses when no real binary resolves.
 
 ## The ranking, precisely
 
-In `pick_json` (jq). Per enabled, signed-in profile, with `now` and the manifest:
+In `rank_json` (jq); `pick_json` is its first element. Per enabled, signed-in
+profile (`--all` keeps disabled ones, sorted last — the teleport probe order),
+with `now` and the manifest:
 
 1. `eff(bucket; grace)`: a bucket whose `resets_at <= now + grace` is 0. Grace is
    `reset_grace_minutes` for the 5-hour window, 0 for the weekly ones.
@@ -170,8 +201,10 @@ In `pick_json` (jq). Per enabled, signed-in profile, with `now` and the manifest
    containing "fable" is a non-Fable session and the Fable bucket becomes `null`.
 3. `exhausted` = locked, or `max(s, w, f) >= threshold`.
 4. `score` = Fable: `max(s·w_session, f·w_fable)`; other: `max(s·w_session, w·w_weekly)`.
-5. Non-exhausted profiles are ranked; if none, all are.
-6. Sort by: known-before-unknown, `floor(score / 5)`, weekly, 5-hour `resets`.
+5. Sort by: enabled first, non-exhausted first, known-before-unknown,
+   `floor(score / 5)`, weekly, 5-hour `resets`. (Exhausted profiles are ranked
+   rather than dropped so the teleport probe still reaches them; for the pick
+   this is the same winner as setting them aside.)
 
 Change the tests in `test/run.sh` under `# pick:` in step with any change here.
 
@@ -183,8 +216,13 @@ fake `claude` (records args; `auth login` writes fake credentials) and a fake
 `curl` (serves `$FAKE_CURL_BODY` with `$FAKE_CURL_CODE`) first on `PATH`,
 `HYDRA_NO_KEYCHAIN=1` so credentials are files, and `HYDRA_NOW` for a fixed
 clock. `usage <5h> <weekly> <fable> [resets…]` builds an endpoint body;
-`set_usage <name> …` serves it and fetches it into the cache. Tests that read
-the hint from a pipe set `HYDRA_QUIET=0`. `fake_claude <path> <version>` writes
+`set_usage <name> …` serves it and fetches it into the cache. The fake curl
+answers the sessions endpoint per bearer token from `$FAKE_SESSIONS` (a token
+not listed gets 404): `sessions a=404 b=200` writes it for the sandbox's
+`tok-<name>@example.com` tokens, and `probes` counts how many profiles a
+launch asked. The `update` test builds its own origin and clone under the
+sandbox and runs the clone's `hydra` through a symlink, never the repo's
+checkout. Tests that read the hint from a pipe set `HYDRA_QUIET=0`. `fake_claude <path> <version>` writes
 the fake anywhere (an "update" is a second one with a new version);
 `native_layout` moves it to `$SB/real/claude` with `$SB/lbin/claude` linking
 to it — the macOS native install shape, `$SB/lbin` standing in for

@@ -15,6 +15,9 @@ hydra → work   5h 12%   week 30%   Fable 8%
 $ claude personal --resume       # force a profile; everything after it is passed to claude
 $ claude mcp list                # claude's own subcommands are left alone
 
+$ claude --teleport session_01…  # pasted from claude.ai/code: routed to the account that owns it
+hydra → personal   owns session_01…
+
 $ hydra status
 PROFILE      ACCOUNT                           5H  WEEK  FABLE  5H-RESET AGE    STATE
 personal     you@example.com                  71%   40%    62%  1h05m    2m     ok
@@ -36,6 +39,7 @@ exec $SHELL
 ```
 
 Needs `jq` and `curl` (`brew install jq`). macOS and Linux; bash 3.2+.
+Later, `hydra update` pulls the latest version into that checkout.
 
 Then register accounts:
 
@@ -116,6 +120,7 @@ shim is ever launched by hydra itself it stops with exit 70 instead of looping.
 | `hydra <profile> [claude args…]` | shorthand for `hydra exec <profile> …` |
 | `hydra bin [PATH \| --unset]` | the real `claude` binary hydra execs, found on PATH at every launch; `PATH` pins one instead (it will not follow updates), `--unset` drops the pin |
 | `hydra doctor` | check the shim: installed, first on PATH, and what a launch would actually run; non-zero with a fix per finding |
+| `hydra update` | fast-forward the git checkout hydra runs from (`claude update` still updates Claude Code); refuses on local changes |
 
 Tab completion (zsh and bash) comes with `hydra.sh`: `hydra <Tab>` offers
 commands and profiles, `hydra login <Tab>` and `claude <Tab>` offer profiles.
@@ -180,6 +185,23 @@ and cannot hop; when it hits a limit, start a new `claude` and hydra routes you
 to the profile with headroom — `claude --resume` picks the transcript straight
 back up because sessions are shared between profiles.
 
+### Teleporting a web session
+
+`claude --teleport <id>` is different: a claude.ai/code session is visible only
+to the account that created it, so the account with the most headroom is
+usually the wrong one and Claude Code answers "Session not found". When a bare
+`claude` carries `--teleport` with an id — the bare `session_…`/`cse_…` id or
+the `claude.ai/code/<id>` URL, exactly as the web UI's command gives it —
+hydra asks each signed-in profile whether it can see that session (the same
+lookup Claude Code makes, one request per profile, best-ranked first) and
+launches the owner, exhausted or not. Disabled profiles are asked too, since a
+session that belongs to one can be teleported nowhere else. If every profile
+says the session does not exist, hydra stops with a message naming them all
+instead of launching; if some could not answer (a lapsed token, no network),
+it launches the best of those and lets Claude Code report. A named profile
+(`claude work --teleport …`) and `--teleport` with no id (Claude's picker)
+skip the probe. This is the one launch that waits on the network.
+
 ## Two machines, zero token sync
 
 `profiles.json` holds names, directories and emails — nothing secret — so it
@@ -210,7 +232,9 @@ for any profile that laptop hasn't logged into yet.
 - **Launch never waits on the network.** `claude` picks from cached numbers
   and starts immediately; stale caches are refreshed in a detached background
   process for the next launch. Polling is floored at 180 s because the
-  endpoint rate-limits anything faster.
+  endpoint rate-limits anything faster. The one exception is `--teleport <id>`,
+  which asks `GET /v1/code/sessions/<id>` under each profile's token before
+  launching — a teleport is a network operation anyway.
 - **The real binary is always exec'd by path**, never by the name `claude`,
   and found at every launch: the first `claude` on PATH that is not the shim
   (the shim carries a marker in its header). `HYDRA_CLAUDE_BIN` and
