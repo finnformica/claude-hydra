@@ -132,6 +132,22 @@ sessions() {
   export FAKE_SESSIONS="$SB/sessions"
 }
 probes() { grep -c '/v1/code/sessions/' "$FAKE_LOG" 2>/dev/null | tr -d ' '; }   # how many profiles were asked
+
+# checkout: a throwaway origin holding this repo's scripts, a clone of it, and $SB/lbin/hydra
+# linking into the clone the way ~/.local/bin/hydra does — so `hydra update` and the update
+# check run against the sandbox, never this repo. Sets UP to the link and UPSTREAM to the
+# clone's tracking branch (origin/main or origin/master, whichever git init chose).
+commit()   { git -C "$1" add -A && git -C "$1" -c user.name=t -c user.email=t@example.com commit -qm "$2"; }
+checkout() {
+  git init -q "$SB/origin" && cp "$ROOT/hydra" "$ROOT/hydra.sh" "$ROOT/claude-shim" "$ROOT/install.sh" "$SB/origin/"
+  commit "$SB/origin" "v1"
+  git clone -q "$SB/origin" "$SB/clone"
+  mkdir -p "$SB/lbin"; ln -s "$SB/clone/hydra" "$SB/lbin/hydra"
+  UP="$SB/lbin/hydra"; UPSTREAM=$(git -C "$SB/clone" rev-parse --abbrev-ref '@{u}')
+}
+upstream_change() { printf '# %s\n' "$2" >>"$SB/origin/$1"; commit "$SB/origin" "$3"; }   # <file> <text> <message>
+stamp() { jq -r "$1" "$HYDRA_HOME/cache/.update-check.json" 2>/dev/null; }
+wait_until() { local _i; for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do eval "$1" && return 0; sleep 0.3; done; return 1; }
 real() { printf '%s/%s' "$(cd "$(dirname "$1")" && pwd -P)" "$(basename "$1")"; }   # what hydra bin prints (macOS: /var → /private/var)
 
 # shim_install: install.sh with $SB/lbin standing in for ~/.local/bin and $SB/rc for the shell rc.
@@ -660,22 +676,19 @@ fi
 
 if test "update: fast-forwards the checkout hydra is linked from"; then
   if ! command -v git >/dev/null 2>&1; then skip "update" "no git"; else
-    commit() { git -C "$1" add -A && git -C "$1" -c user.name=t -c user.email=t@example.com commit -qm "$2"; }
-    git init -q "$SB/origin" && cp "$ROOT/hydra" "$ROOT/hydra.sh" "$ROOT/claude-shim" "$ROOT/install.sh" "$SB/origin/" && commit "$SB/origin" "v1"
-    git clone -q "$SB/origin" "$SB/clone"
-    mkdir -p "$SB/lbin"; ln -s "$SB/clone/hydra" "$SB/lbin/hydra"
+    checkout
     out=$("$SB/lbin/hydra" update 2>&1); rc=$?
     assert_eq "nothing to pull: exit 0" "0" "$rc"
     assert_contains "…and says so" "up to date" "$out"
-    printf '# a comment\n' >>"$SB/origin/hydra.sh"; commit "$SB/origin" "hydra.sh: tweak"
-    printf '# another\n' >>"$SB/origin/hydra"; commit "$SB/origin" "hydra: tweak"
+    upstream_change hydra.sh "a comment" "hydra.sh: tweak"
+    upstream_change hydra "another" "hydra: tweak"
     out=$("$SB/lbin/hydra" update 2>&1); rc=$?
     assert_eq "pulled: exit 0" "0" "$rc"
     assert_eq "the clone is at origin's head" "$(git -C "$SB/origin" rev-parse HEAD)" "$(git -C "$SB/clone" rev-parse HEAD)"
     assert_contains "lists what came in (1)" "hydra.sh: tweak" "$out"
     assert_contains "lists what came in (2)" "hydra: tweak" "$out"
     assert_contains "hydra.sh changed: reload advice" 'exec $SHELL' "$out"
-    printf '# more\n' >>"$SB/origin/hydra"; commit "$SB/origin" "hydra only"
+    upstream_change hydra "more" "hydra only"
     out=$("$SB/lbin/hydra" update 2>&1)
     assert_not_contains "hydra.sh unchanged: no reload advice" 'exec $SHELL' "$out"
     printf '# local\n' >>"$SB/clone/hydra"
@@ -687,6 +700,61 @@ if test "update: fast-forwards the checkout hydra is linked from"; then
     assert_eq "not a checkout: refuses" "1" "$rc"
     assert_contains "…and explains" "not a git checkout" "$out"
     assert_eq "update is a reserved profile name" "1" "$("$HYDRA" add update --no-login >/dev/null 2>&1; echo $?)"
+    assert_fails "update takes only --check" "$SB/lbin/hydra" update --now
+  fi
+fi
+
+if test "update: a launch notices when hydra is behind its upstream"; then
+  if ! command -v git >/dev/null 2>&1; then skip "update check" "no git"; else
+    checkout; add w; set_usage w 0 0 0
+    out=$(HYDRA_QUIET=0 "$UP" exec -p hi 2>&1)
+    assert_contains "routed as usual" "dir=$HYDRA_HOME/profiles/w" "$out"
+    assert_not_contains "up to date: no nudge" "hydra update" "$out"
+    assert_ok "the launch fetched in the background" wait_until '[ "$(stamp .checked_at)" = "$NOW" ]'
+    assert_eq "…and it worked" "true" "$(stamp .fetched)"
+    upstream_change hydra.sh "new" "hydra.sh: something new"
+    out=$(HYDRA_QUIET=0 "$UP" exec -p hi 2>&1); sleep 0.5
+    assert_not_contains "inside the window: nothing fetched, so nothing to say" "hydra update" "$out"
+    assert_eq "…the stamp is untouched" "$NOW" "$(stamp .checked_at)"
+    later=$((NOW + 90000))
+    out=$(HYDRA_QUIET=0 HYDRA_NOW=$later "$UP" exec -p hi 2>&1)
+    assert_not_contains "a day later: the fetch is not in the launch path, so this launch still says nothing" "hydra update" "$out"
+    assert_ok "…but it ran afterwards" wait_until '[ "$(stamp .checked_at)" = "$later" ]'
+    out=$(HYDRA_QUIET=0 HYDRA_NOW=$later "$UP" exec -p hi 2>&1)
+    assert_contains "the next launch nudges" "hydra: 1 commit behind $UPSTREAM — hydra update" "$out"
+    assert_contains "…naming the newest commit" "(latest: hydra.sh: something new)" "$out"
+    assert_contains "…and still launches" "dir=$HYDRA_HOME/profiles/w" "$out"
+    HYDRA_QUIET= HYDRA_NOW=$later "$UP" exec -p hi 2>"$SB/err" >/dev/null
+    assert_eq "headless (stderr not a terminal): not a word" "" "$(cat "$SB/err")"
+    assert_contains "status says it too, terminal or not" "1 commit behind $UPSTREAM" "$(HYDRA_NOW=$later "$UP" status --cached 2>&1 >/dev/null)"
+    assert_contains "doctor notes it with the fix" "1 commit(s) behind $UPSTREAM: hydra update" "$(HYDRA_NOW=$later "$UP" doctor 2>&1 || true)"
+    assert_contains "update --check reports it" "1 commit behind" "$(HYDRA_NOW=$later "$UP" update --check 2>&1)"
+    upstream_change hydra "again" "hydra: second"
+    HYDRA_NOW=$later "$UP" update --check >/dev/null 2>&1
+    assert_contains "plural" "2 commits behind" "$(HYDRA_QUIET=0 HYDRA_NOW=$later "$UP" exec -p hi 2>&1)"
+    assert_not_contains "HYDRA_NO_UPDATE_CHECK silences the launch" "behind" "$(HYDRA_NO_UPDATE_CHECK=1 HYDRA_QUIET=0 HYDRA_NOW=$later "$UP" exec -p hi 2>&1)"
+    assert_contains "…and doctor says why" "update check is off" "$(HYDRA_NO_UPDATE_CHECK=1 "$UP" doctor 2>&1 || true)"
+    jq '.update_check = false' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
+    rm -f "$HYDRA_HOME/cache/.update-check.json"
+    out=$(HYDRA_QUIET=0 HYDRA_NOW=$later "$UP" exec -p hi 2>&1); sleep 0.5
+    assert_not_contains "update_check: false in the manifest silences it" "behind" "$out"
+    assert_eq "…and never fetches" "" "$(stamp .checked_at)"
+    jq 'del(.update_check)' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
+    HYDRA_NOW=$later "$UP" update >/dev/null 2>&1
+    assert_eq "hydra update counts as the fetch" "$later" "$(stamp .checked_at)"   # before any launch: a launch a day on would fetch again
+    out=$(HYDRA_QUIET=0 HYDRA_NOW=$later "$UP" exec -p hi 2>&1)
+    assert_not_contains "after hydra update the nudge is gone" "behind" "$out"
+    assert_contains "doctor: up to date, with the age of the check" "up to date with $UPSTREAM (checked" "$(HYDRA_NOW=$((later + 3600)) "$UP" doctor 2>&1 || true)"
+    git -C "$SB/clone" pull -q   # a manual pull, no hydra involved
+    upstream_change hydra "third" "hydra: third"; HYDRA_NOW=$later "$UP" update --check >/dev/null 2>&1
+    git -C "$SB/clone" pull -q
+    assert_not_contains "a manual pull clears it at once: behind is counted live, not cached" "behind" "$(HYDRA_QUIET=0 HYDRA_NOW=$later "$UP" exec -p hi 2>&1)"
+    mkdir -p "$SB/copy"; cp "$ROOT/hydra" "$SB/copy/hydra"
+    out=$(HYDRA_QUIET=0 "$SB/copy/hydra" exec -p hi 2>&1)
+    assert_contains "a plain copy launches" "dir=$HYDRA_HOME/profiles/w" "$out"
+    assert_not_contains "…without a nudge" "behind" "$out"
+    assert_contains "doctor on a copy explains" "not a git checkout tracking a remote branch" "$("$SB/copy/hydra" doctor 2>&1 || true)"
+    assert_fails "update --check on a copy fails" "$SB/copy/hydra" update --check
   fi
 fi
 

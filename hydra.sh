@@ -64,6 +64,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
         add) [[ "${words[CURRENT]}" == -* ]] && compadd -- --existing --dir --no-login ;;
         status) compadd -- --cached --force --json ;;
         bin) compadd -- --unset; _files ;;
+        update) compadd -- --check ;;
         *) _files ;;
       esac
     fi
@@ -91,6 +92,7 @@ elif [ -n "${BASH_VERSION:-}" ]; then
         login|remove|rm|rename|enable|disable|dir|has|refresh|link|exec)
           COMPREPLY=($(compgen -W "$(hydra names 2>/dev/null)" -- "$cur")) ;;
         status) COMPREPLY=($(compgen -W "--cached --force --json" -- "$cur")) ;;
+        update) COMPREPLY=($(compgen -W "--check" -- "$cur")) ;;
         *) COMPREPLY=($(compgen -f -- "$cur")) ;;
       esac
     fi
