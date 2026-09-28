@@ -740,10 +740,10 @@ if test "update: a launch notices when hydra is behind its upstream"; then
     assert_not_contains "update_check: false in the manifest silences it" "behind" "$out"
     assert_eq "…and never fetches" "" "$(stamp .checked_at)"
     jq 'del(.update_check)' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
-    "$UP" update >/dev/null 2>&1
+    HYDRA_NOW=$later "$UP" update >/dev/null 2>&1
+    assert_eq "hydra update counts as the fetch" "$later" "$(stamp .checked_at)"   # before any launch: a launch a day on would fetch again
     out=$(HYDRA_QUIET=0 HYDRA_NOW=$later "$UP" exec -p hi 2>&1)
     assert_not_contains "after hydra update the nudge is gone" "behind" "$out"
-    assert_eq "…and the pull counted as the fetch" "$later" "$(stamp .checked_at)"
     assert_contains "doctor: up to date, with the age of the check" "up to date with $UPSTREAM (checked" "$(HYDRA_NOW=$((later + 3600)) "$UP" doctor 2>&1 || true)"
     git -C "$SB/clone" pull -q   # a manual pull, no hydra involved
     upstream_change hydra "third" "hydra: third"; HYDRA_NOW=$later "$UP" update --check >/dev/null 2>&1
