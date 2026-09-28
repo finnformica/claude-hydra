@@ -27,6 +27,7 @@ LOCAL_BIN="${HYDRA_BIN_DIR:-$HOME/.local/bin}"   # where Claude Code's native in
 
 USAGE_URL="https://api.anthropic.com/api/oauth/usage"
 MIN_REFRESH_S=180 # the usage endpoint rate-limits anything faster than this
+SESSIONS_URL="https://api.anthropic.com/v1/code/sessions"   # what `claude --teleport` resolves an id against
 
 # Shared between every profile, by symlink into ~/.claude.
 SHARED_DIRS="skills plugins projects commands agents"
@@ -34,7 +35,7 @@ SHARED_FILES="settings.json CLAUDE.md history.jsonl"
 
 # Claude's own subcommands: never routed unless a profile is named first.
 PASSTHROUGH="agents attach auth auto-mode doctor gateway import install logs mcp plugin plugins project respawn rm setup-token stop kill ultrareview update upgrade"
-HYDRA_CMDS="add login remove rm rename enable disable list ls names link status refresh pick dir has exec bin doctor help"
+HYDRA_CMDS="add login remove rm rename enable disable list ls names link status refresh pick dir has exec bin doctor update help"
 RESERVED="auto best $HYDRA_CMDS $PASSTHROUGH"
 
 # ---------------------------------------------------------------- utilities
@@ -488,28 +489,110 @@ refresh() {
   SNAPSHOTS=""
 }
 
-# Ranks enabled, signed-in profiles; prints one JSON object for the winner.
+# Ranks signed-in profiles, best first; prints the JSON array. Disabled
+# profiles are left out unless --all, when they trail every enabled one.
 #   Fable session:  score = max(session × w_session, fable × w_fable); ties → weekly
 #   other model:    score = max(session × w_session, weekly × w_weekly); Fable ignored
 #   ties within 5 points → the soonest 5-hour reset
-#   anything at/over the threshold, or locked, is only used when nothing else is
-pick_json() {
-  local intent; intent=$(model_label "$(model_intent "${1:-}")")
-  snapshots | jq -c --argjson cfg "$(manifest)" --argjson now "$(now)" --arg intent "$intent" "$JQ_LIB"'
+#   anything at/over the threshold, or locked, ranks below everything that is not
+rank_json() {
+  local intent all=false
+  [ "${2:-}" = "--all" ] && all=true
+  intent=$(model_label "$(model_intent "${1:-}")")
+  snapshots | jq -c --argjson cfg "$(manifest)" --argjson now "$(now)" --arg intent "$intent" --argjson all "$all" "$JQ_LIB"'
     ($cfg.threshold // 90) as $threshold
     | (($cfg.reset_grace_minutes // 10) * 60) as $grace
     | ($cfg.weights.session // 1) as $ws
     | ($cfg.weights.fable // 1) as $wf
     | ($cfg.weights.weekly // 1) as $ww
     | ($intent == "fable") as $fable
-    | map(select(.signed_in and (.disabled | not)))
+    | map(select(.signed_in and ($all or (.disabled | not))))
     | map(. + {s: eff(.session; $grace), w: eff(.weekly; 0), f: (if $fable then eff(.fable; 0) else null end)})
     | map(. + {known: (.session != null), intent: $intent})
     | map(. + {exhausted: (.locked or (([.s, .w, .f] | map(. // 0) | max) >= $threshold))})
     | map(. + {score: (if $fable then [(.s // 0) * $ws, (.f // 0) * $wf] else [(.s // 0) * $ws, (.w // 0) * $ww] end | max)})
-    | (map(select(.exhausted | not)) as $ok | if ($ok | length) > 0 then $ok else . end)
-    | sort_by([(if .known then 0 else 1 end), (.score / 5 | floor), (.w // 0), (.session.resets // 0)])
-    | .[0] // empty'
+    | sort_by([(if .disabled then 1 else 0 end), (if .exhausted then 1 else 0 end),
+               (if .known then 0 else 1 end), (.score / 5 | floor), (.w // 0), (.session.resets // 0)])'
+}
+
+# The profile a bare `claude` launches: one JSON object, or nothing when no
+# enabled profile is signed in.
+pick_json() { rank_json "${1:-}" | jq -c '.[0] // empty'; }
+
+# ---------------------------------------------------------------- teleport
+
+# `claude --teleport <id>` pulls a claude.ai/code session into the terminal, and
+# only the account that owns the session can see it — headroom is the wrong
+# thing to route on. Claude Code resolves the id with a single request,
+# GET /v1/code/sessions/<id> under the profile's token, and prints a 404 as
+# "Session not found"; hydra asks every signed-in profile the same question and
+# launches the one that answers 200. Disabled profiles are asked too: a session
+# that belongs to one can be teleported nowhere else. This is the one launch
+# that waits on the network — a teleport is a network operation anyway.
+
+# The session id in a claude argument list: bare (session_…, cse_…) or the
+# claude.ai/code/<id> URL the web UI hands out, with or without scheme and
+# query string. Prints nothing for `--teleport` alone (the picker) or an id
+# that could not go into a URL.
+teleport_id() {
+  local prev="" a v=""
+  for a in "$@"; do
+    case "$a" in
+      --teleport=*) v="${a#--teleport=}"; break ;;
+      -*) prev="$a"; continue ;;
+    esac
+    [ "$prev" = "--teleport" ] && { v="$a"; break; }
+    prev=""
+  done
+  v="${v%%\?*}"; v="${v%%#*}"; v="${v%/}"; v="${v##*/}"
+  [ -n "$v" ] || return 0
+  [ -z "$(printf '%s' "$v" | LC_ALL=C tr -d 'A-Za-z0-9_-')" ] || return 0
+  printf '%s' "$v"
+}
+
+# Asks one profile whether it can see a session. Prints the HTTP status, 000
+# when the request never completed, or no-auth when there is no token to ask with.
+probe_session() {
+  local dir="$1" id="$2" creds token
+  creds=$(credentials "$dir") || { printf 'no-auth'; return 0; }
+  token=$(printf '%s' "$creds" | jq -r '.claudeAiOauth.accessToken // empty')
+  [ -n "$token" ] || { printf 'no-auth'; return 0; }
+  curl -sS -m 10 -o /dev/null -w '%{http_code}' "$SESSIONS_URL/$id" \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "User-Agent: claude-code/${CLAUDE_VERSION:-$(claude_version)}" \
+    -H "Content-Type: application/json" 2>/dev/null || printf '000'
+}
+
+probe_word() { case "$1" in 200) printf 'owns it' ;; 404) printf 'not found' ;; 401) printf 'token stale' ;; 000) printf 'offline' ;; no-auth) printf 'no token' ;; *) printf 'http %s' "$1" ;; esac; }
+
+# Which profile to launch a teleport on. Prints "<name>\t<why>" and succeeds:
+# the owner when one answers 200; otherwise the best-ranked profile that did not
+# say 404 (a stale token or no network leaves the question open, and Claude Code
+# will answer it itself a moment later). Fails, printing the reason, when every
+# profile said the session does not exist for it.
+teleport_route() {
+  local id="$1" model="${2:-}" n code owner="" open="" disabled="" notes=""
+  CLAUDE_VERSION=$(claude_version); export CLAUDE_VERSION
+  for n in $(rank_json "$model" --all | jq -r '.[].name'); do
+    code=$(probe_session "$(profile_dir "$n")" "$id")
+    case "$code" in
+      200) owner="$n"; break ;;
+      404) ;;
+      *) [ -n "$open" ] || open="$n" ;;
+    esac
+    notes="${notes:+$notes, }$n: $(probe_word "$code")"
+  done
+  if [ -n "$owner" ]; then
+    profile_disabled "$owner" && disabled=" (disabled — nobody else can teleport it)"
+    printf '%s\towns %s%s\n' "$owner" "$id" "$disabled"
+  elif [ -n "$open" ]; then
+    printf '%s\tcould not tell who owns %s (%s)\n' "$open" "$id" "$notes"
+  elif [ -n "$notes" ]; then
+    printf 'no profile on this machine can see %s (%s)\n' "$id" "$notes"; return 1
+  else
+    printf 'no signed-in profile on this machine to teleport %s with\n' "$id"; return 1
+  fi
 }
 
 fmt_pct() { if [ "$1" = "null" ] || [ -z "$1" ]; then printf '   -'; else printf '%3s%%' "$1"; fi; }
@@ -771,6 +854,14 @@ cmd_exec() {
     fi
   fi
 
+  local sid=""
+  [ -n "$name" ] || sid=$(teleport_id "$@")
+  if [ -n "$sid" ]; then
+    local route; route=$(teleport_route "$sid" "$(model_from_args "$@")") || die "$route"
+    name=${route%%	*}
+    hint "hydra → $name   ${route#*	}"
+  fi
+
   if [ -z "$name" ]; then
     ensure_usage
     local p; p=$(pick_json "$(model_from_args "$@")") || true
@@ -810,6 +901,34 @@ cmd_bin() {
   esac
 }
 
+# hydra update: fast-forward the git checkout this script runs from. hydra is
+# symlinked into it, so the pull is the whole update; only hydra.sh needs a
+# shell reload, and the shim is a symlink into the same checkout.
+cmd_update() {
+  need git
+  local repo before after branch
+  repo=$(dirname "$(real_path "$0")")
+  git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "$(contract "$repo") is not a git checkout — update hydra the way it was installed"
+  [ -z "$(git -C "$repo" status --porcelain 2>/dev/null)" ] ||
+    die "the checkout at $(contract "$repo") has local changes — commit or stash them, then hydra update"
+  branch=$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null) ||
+    die "the checkout at $(contract "$repo") is not on a branch — check one out, then hydra update"
+  before=$(git -C "$repo" rev-parse HEAD)
+  git -C "$repo" pull --ff-only --quiet ||
+    die "git pull --ff-only failed in $(contract "$repo") (branch $branch) — see the git output above"
+  after=$(git -C "$repo" rev-parse HEAD)
+  if [ "$before" = "$after" ]; then
+    say "hydra is up to date ($(git -C "$repo" rev-parse --short HEAD), $branch)"
+    return 0
+  fi
+  say "hydra updated $(git -C "$repo" rev-parse --short "$before") → $(git -C "$repo" rev-parse --short "$after") ($branch):"
+  git -C "$repo" log --oneline "$before..$after" | sed 's/^/  /' >&2
+  if [ -n "$(git -C "$repo" diff --name-only "$before" "$after" -- hydra.sh)" ]; then
+    say "hydra.sh changed: exec \$SHELL (or open a new terminal) to load it"
+  fi
+}
+
 cmd_help() {
   cat <<'EOF'
 hydra — many heads, one Claude Code
@@ -839,6 +958,10 @@ hydra — many heads, one Claude Code
   hydra bin [PATH | --unset]  the real claude binary hydra execs (found on PATH at every
                               launch); pin one, or drop the pin
   hydra doctor                check the shim: installed, first on PATH, and what it runs
+  hydra update                pull the latest hydra into the checkout it runs from
+
+  claude --teleport <id|url>  routed to the profile that owns the session, disabled or not;
+                              paste the command from claude.ai/code as it is
 
 Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_CLAUDE_BIN (pin the real binary),
              HYDRA_QUIET=1 (never print the routing hint; default: only on a terminal;
@@ -864,6 +987,7 @@ case "${1:-help}" in
   exec)    shift; cmd_exec "$@" ;;
   bin)     shift; cmd_bin "$@" ;;
   doctor)  cmd_doctor ;;
+  update)  cmd_update ;;
   help|-h|--help) cmd_help ;;
   *) if has_profile "$1"; then cmd_exec "$@"; else die "unknown command '$1' (hydra help)"; fi ;;
 esac
