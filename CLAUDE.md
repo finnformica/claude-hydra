@@ -14,7 +14,7 @@ the invariants that are easy to break.
 
 | File | Role |
 |---|---|
-| `hydra` | The whole CLI, one bash script. Sections in order: utilities, manifest, credentials, model intent, usage (fetch/snapshot/refresh/rank/pick), teleport, linking, commands, dispatch. |
+| `hydra` | The whole CLI, one bash script. Sections in order: utilities, manifest, credentials, model intent, usage (fetch/snapshot/refresh/rank/pick), teleport, linking, commands (with the update check just before `cmd_update`), dispatch. |
 | `hydra.sh` | Sourced by the user's rc file. Defines the `claude()` function (→ `hydra exec "$@"`) and zsh/bash tab completion. |
 | `claude-shim` | Opt-in stand-in for the `claude` binary on PATH (→ `hydra exec "$@"`), so launchers that bypass the shell function are routed too. Linked as `$HYDRA_HOME/bin/claude`, *ahead of* the real binary, never in its place. Carries the `hydra-shim` marker in its header. |
 | `install.sh` | Symlinks `hydra` into `~/.local/bin`, appends the `source` line to `~/.zshrc`. `--shim` links `$HYDRA_HOME/bin/claude` to the shim and adds a marked `export PATH=…` line to the rc; `--unshim` removes both. Both migrate the old in-place layout. |
@@ -23,7 +23,9 @@ the invariants that are easy to break.
 
 Runtime state lives outside the repo in `$HYDRA_HOME` (default `~/.hydra`):
 `profiles.json` (the manifest — names, dirs, emails, tuning, an optional
-`claude_bin` pin; no secrets), `cache/<name>.json` (usage snapshots),
+`claude_bin` pin, an optional `update_check: false`; no secrets),
+`cache/<name>.json` (usage snapshots), `cache/.update-check.json` (when hydra
+last fetched its own upstream; the dot keeps it clear of profile names),
 `profiles/<name>/` (each profile's `CLAUDE_CONFIG_DIR`), and `bin/claude` (the
 shim, when installed). The default profile is `~/.claude` itself.
 
@@ -70,7 +72,13 @@ committed. The manifest is designed to be shareable via dotfiles.
 `exec`s; a stale cache is refreshed by a detached `( "$0" refresh … & )` after
 the pick. The only synchronous fetch is `ensure_usage`, for a signed-in profile
 with no data at all (first launch after sign-in). The one deliberate exception
-is a teleport, below.
+is a teleport, below. hydra's own update check keeps to the rule: the fetch is
+a detached `( "$0" update --check & )` from `background_update_check`, at most
+once per `UPDATE_CHECK_S` (a day, stamped in `UPDATE_STAMP` whether or not the
+fetch succeeded, so an offline machine does not retry every launch), and
+`update_notice` decides what to say from a local `git rev-list --count
+HEAD..@{u}`, never a fetch — which is also why a manual pull clears the nudge
+at once. `status --cached` skips the fetch too: `--cached` means no network.
 
 **A teleport is routed on ownership, not headroom.** A claude.ai/code session
 is visible only to the account that created it, and Claude Code resolves
@@ -176,7 +184,19 @@ subcommands to `HYDRA_CMDS` *and* to the completion lists in `hydra.sh`.
 Because `~/.local/bin/hydra` and the shim are symlinks into the clone, the pull
 is the whole update; the command refuses on local changes, a detached HEAD or
 a copy that is not a checkout, and only tells the user to reload the shell when
-`hydra.sh` itself changed. It never touches `$HYDRA_HOME`.
+`hydra.sh` itself changed. A successful pull restamps the check (it was a
+fetch). Beyond that stamp it never touches `$HYDRA_HOME`.
+
+**The "behind" nudge is silent whenever it cannot be sure.** `hydra_upstream`
+fails for a plain copy, a missing `git`, or a checkout with no tracking branch,
+and every caller treats that as nothing to say; `update_check_enabled` (the
+`HYDRA_NO_UPDATE_CHECK` env var, `update_check: false` in the manifest) gates
+both the fetch and the line. The line itself goes through `hint` on a launch
+(terminal only — a headless `claude -p` must never see it), `say` in `status`
+(like the shim warning, always), and `note` in `doctor` (a note, never a
+finding: an old hydra is not a broken one). `doctor` is the only place the
+"cannot be sure" cases are visible, and it reads the stamp rather than
+fetching — a fetch with no timeout has no business in a diagnostic either.
 
 **The shim install is reversible and idempotent, and migrates the old layout.**
 Before the shadow layout, `--shim` put the shim *in place of* `$bin/claude`,
@@ -220,9 +240,13 @@ clock. `usage <5h> <weekly> <fable> [resets…]` builds an endpoint body;
 answers the sessions endpoint per bearer token from `$FAKE_SESSIONS` (a token
 not listed gets 404): `sessions a=404 b=200` writes it for the sandbox's
 `tok-<name>@example.com` tokens, and `probes` counts how many profiles a
-launch asked. The `update` test builds its own origin and clone under the
-sandbox and runs the clone's `hydra` through a symlink, never the repo's
-checkout. Tests that read the hint from a pipe set `HYDRA_QUIET=0`. `fake_claude <path> <version>` writes
+launch asked. The `update` tests use `checkout`: an origin holding this repo's
+scripts, a clone, and `$SB/lbin/hydra` linking into the clone (`$UP`), so
+`hydra update` and the update check run against the sandbox and never this
+checkout; `UPSTREAM` is whatever tracking branch `git init` produced (main or
+master — never hard-code it), `upstream_change` commits to the origin, `stamp`
+reads the check stamp and `wait_until` polls for a background job. Tests that
+read the hint from a pipe set `HYDRA_QUIET=0`. `fake_claude <path> <version>` writes
 the fake anywhere (an "update" is a second one with a new version);
 `native_layout` moves it to `$SB/real/claude` with `$SB/lbin/claude` linking
 to it — the macOS native install shape, `$SB/lbin` standing in for

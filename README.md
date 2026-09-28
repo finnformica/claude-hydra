@@ -39,7 +39,13 @@ exec $SHELL
 ```
 
 Needs `jq` and `curl` (`brew install jq`). macOS and Linux; bash 3.2+.
-Later, `hydra update` pulls the latest version into that checkout.
+Later, `hydra update` pulls the latest version into that checkout. hydra
+notices on its own when that checkout falls behind: once a day, after a
+launch, it fetches the branch the checkout tracks in the background, and from
+then on every launch, `hydra status` and `hydra doctor` carry one line —
+`hydra: 3 commits behind origin/main — hydra update` — until you do.
+`HYDRA_NO_UPDATE_CHECK=1` silences it for a shell; `"update_check": false` in
+the manifest, for good.
 
 Then register accounts:
 
@@ -120,7 +126,7 @@ shim is ever launched by hydra itself it stops with exit 70 instead of looping.
 | `hydra <profile> [claude args…]` | shorthand for `hydra exec <profile> …` |
 | `hydra bin [PATH \| --unset]` | the real `claude` binary hydra execs, found on PATH at every launch; `PATH` pins one instead (it will not follow updates), `--unset` drops the pin |
 | `hydra doctor` | check the shim: installed, first on PATH, and what a launch would actually run; non-zero with a fix per finding |
-| `hydra update` | fast-forward the git checkout hydra runs from (`claude update` still updates Claude Code); refuses on local changes |
+| `hydra update [--check]` | fast-forward the git checkout hydra runs from (`claude update` still updates Claude Code); refuses on local changes. `--check` only fetches and says whether it is behind |
 
 Tab completion (zsh and bash) comes with `hydra.sh`: `hydra <Tab>` offers
 commands and profiles, `hydra login <Tab>` and `claude <Tab>` offer profiles.
@@ -130,8 +136,9 @@ script capturing stderr never sees it; `HYDRA_QUIET=1` always suppresses it and
 `HYDRA_QUIET=0` always prints it. `HYDRA_MODEL=opus` scores launches for that
 model when no `--model` is passed. `HYDRA_CLAUDE_BIN` pins the real binary for
 one invocation (it beats `claude_bin` in the manifest, which beats the PATH
-search). `HYDRA_HOME` (default `~/.hydra`) and `HYDRA_MANIFEST` (default
-`$HYDRA_HOME/profiles.json`) move the state.
+search). `HYDRA_NO_UPDATE_CHECK=1` stops hydra fetching its own upstream and
+mentioning that it is behind. `HYDRA_HOME` (default `~/.hydra`) and
+`HYDRA_MANIFEST` (default `$HYDRA_HOME/profiles.json`) move the state.
 
 ## How a profile is chosen
 
@@ -170,7 +177,9 @@ Threshold, weights, grace and default model live in `profiles.json`:
 }
 ```
 
-An optional `claude_bin` (set with `hydra bin PATH`) pins the binary hydra
+An optional `"update_check": false` turns off the daily fetch of hydra's own
+upstream and the "commits behind" line. An optional `claude_bin` (set with
+`hydra bin PATH`) pins the binary hydra
 execs; it is machine-specific and does not follow Claude Code updates, so leave
 it unset unless you need it — the default is the first `claude` on PATH that is
 not hydra's own shim, found at every launch. A pin that does not run on this
@@ -234,7 +243,10 @@ for any profile that laptop hasn't logged into yet.
   process for the next launch. Polling is floored at 180 s because the
   endpoint rate-limits anything faster. The one exception is `--teleport <id>`,
   which asks `GET /v1/code/sessions/<id>` under each profile's token before
-  launching — a teleport is a network operation anyway.
+  launching — a teleport is a network operation anyway. hydra's own update
+  check works the same way: a detached `git fetch` of the checkout's upstream
+  at most once a day, and a local `rev-list` count at launch to decide whether
+  to say anything.
 - **The real binary is always exec'd by path**, never by the name `claude`,
   and found at every launch: the first `claude` on PATH that is not the shim
   (the shim carries a marker in its header). `HYDRA_CLAUDE_BIN` and

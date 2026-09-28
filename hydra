@@ -28,6 +28,8 @@ LOCAL_BIN="${HYDRA_BIN_DIR:-$HOME/.local/bin}"   # where Claude Code's native in
 USAGE_URL="https://api.anthropic.com/api/oauth/usage"
 MIN_REFRESH_S=180 # the usage endpoint rate-limits anything faster than this
 SESSIONS_URL="https://api.anthropic.com/v1/code/sessions"   # what `claude --teleport` resolves an id against
+UPDATE_CHECK_S=86400                        # how often a launch may fetch hydra's own upstream, in the background
+UPDATE_STAMP="$CACHE_DIR/.update-check.json"   # when it last did; the dot keeps it clear of profile caches
 
 # Shared between every profile, by symlink into ~/.claude.
 SHARED_DIRS="skills plugins projects commands agents"
@@ -329,6 +331,20 @@ cmd_doctor() {
     if [ -n "${HYDRA_CLAUDE_BIN:-}" ]; then how="unset HYDRA_CLAUDE_BIN, or point it at the real binary"
     else how="install Claude Code and put it on PATH (hydra never runs its own shim)"; fi
     problem "cannot resolve the real claude: ${real#hydra: }" "$how"
+  fi
+
+  # 4. is hydra itself current? Reads the last background fetch; never fetches here.
+  local r b last
+  if ! update_check_enabled; then
+    note "update check is off (HYDRA_NO_UPDATE_CHECK, or update_check: false in the manifest)"
+  elif ! r=$(hydra_upstream); then
+    note "$(contract "$(hydra_repo)") is not a git checkout tracking a remote branch: hydra update and the update check do nothing here"
+  elif b=$(update_behind); then
+    note "hydra is ${b%%	*} commit(s) behind ${r#*	}: hydra update"
+  elif last=$(jq -r '.checked_at // empty' "$UPDATE_STAMP" 2>/dev/null) && [ -n "$last" ]; then
+    ok "hydra is up to date with ${r#*	} (checked $(fmt_in $(( $(now) - last ))) ago)"
+  else
+    note "hydra has not checked ${r#*	} for updates yet; the next launch does, or: hydra update --check"
   fi
 
   return "$rc"
@@ -785,7 +801,9 @@ cmd_status() {
       say "hydra: warning: hydra.sh is not sourced in this shell and ${winner:-nothing} wins a PATH search, so nothing here is routed — exec \$SHELL (hydra doctor)"
     fi
   fi
+  local nudge; nudge=$(update_notice); [ -z "$nudge" ] || say "$nudge"
   if [ "$cached" -eq 0 ]; then
+    background_update_check   # --cached means no network, the update fetch included
     if [ "$force" -eq 1 ]; then refresh --force >/dev/null; else refresh --stale >/dev/null; fi
   fi
   local threshold; threshold=$(manifest | jq -r '.threshold // 90')
@@ -873,6 +891,8 @@ cmd_exec() {
     hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%\(if .intent == "fable" then "   Fable \(.f // "-")%" else "   (\(.intent): Fable window ignored)" end)\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
   fi
 
+  local nudge; nudge=$(update_notice); [ -z "$nudge" ] || hint "$nudge"
+  background_update_check
   background_refresh
   local dir; dir=$(profile_dir "$name")
   if is_default_dir "$dir"; then launch "$@"
@@ -901,13 +921,97 @@ cmd_bin() {
   esac
 }
 
+# ---------------------------------------------------------------- update
+
+# hydra has no version number: it is a git checkout, and "a new version" means
+# that checkout is behind the branch it tracks. The fetch that finds out runs
+# detached after a launch (or a status), at most once per UPDATE_CHECK_S, like
+# the usage refresh; how far behind is then a local question (rev-list against
+# the fetched ref), cheap enough to ask on every launch, so the nudge can never
+# outlive a manual pull. A plain copy, no git, no upstream: everything here is
+# silent, and `doctor` is where that shows.
+
+# The git checkout this script runs from (~/.local/bin/hydra is a symlink into it).
+hydra_repo() { dirname "$(real_path "$0")"; }
+
+# Prints "<repo>\t<upstream>" when the checkout tracks a remote branch; fails quietly otherwise.
+hydra_upstream() {
+  local repo up
+  command -v git >/dev/null 2>&1 || return 1
+  repo=$(hydra_repo)
+  up=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || return 1
+  [ -n "$up" ] || return 1
+  printf '%s\t%s' "$repo" "$up"
+}
+
+# HYDRA_NO_UPDATE_CHECK=1 for a shell, update_check: false in the manifest for good.
+update_check_enabled() {
+  [ -z "${HYDRA_NO_UPDATE_CHECK:-}" ] || return 1
+  manifest | jq -e '.update_check != false' >/dev/null 2>&1
+}
+
+# Prints "<n>\t<upstream>\t<newest subject>" when the checkout is behind; fails when
+# it is not, or when nobody can tell. Local: reads what the last fetch brought.
+update_behind() {
+  local r repo up n
+  r=$(hydra_upstream) || return 1
+  repo=${r%%	*}; up=${r#*	}
+  n=$(git -C "$repo" rev-list --count 'HEAD..@{u}' 2>/dev/null) || return 1
+  [ "$n" -gt 0 ] 2>/dev/null || return 1
+  printf '%s\t%s\t%s' "$n" "$up" "$(git -C "$repo" log -1 --format=%s '@{u}' 2>/dev/null)"
+}
+
+# The one-line nudge; empty when there is nothing to say. The launch prints it
+# through hint (terminals only), status through say, doctor as a note.
+update_notice() {
+  local b n up subj plural=""
+  update_check_enabled || return 0
+  b=$(update_behind) || return 0
+  n=${b%%	*}; b=${b#*	}; up=${b%%	*}; subj=${b#*	}
+  [ "$n" -eq 1 ] || plural=s
+  printf 'hydra: %s commit%s behind %s — hydra update   (latest: %s)' "$n" "$plural" "$up" "$subj"
+}
+
+# Stamps when the upstream was last fetched, so the next window can be counted.
+# Written on failure too: an offline machine must not retry on every launch.
+stamp_update_check() {
+  mkdir -p "$CACHE_DIR"
+  jq -n --argjson at "$(now)" --argjson ok "$1" '{checked_at: $at, fetched: $ok}' >"$UPDATE_STAMP.tmp.$$" &&
+    mv "$UPDATE_STAMP.tmp.$$" "$UPDATE_STAMP"
+}
+
+# hydra update --check: fetch the upstream now and report. Non-zero when the
+# checkout cannot be checked or the fetch failed; being behind is not an error.
+update_check() {
+  local r repo up
+  r=$(hydra_upstream) || die "$(contract "$(hydra_repo)") is not a git checkout tracking a remote branch, so there is nothing to check"
+  repo=${r%%	*}; up=${r#*	}
+  if git -C "$repo" fetch --quiet "${up%%/*}" 2>/dev/null; then stamp_update_check true
+  else stamp_update_check false; die "could not fetch ${up%%/*} for $(contract "$repo")"; fi
+  local nudge; nudge=$(update_notice)
+  if [ -n "$nudge" ]; then say "$nudge"
+  elif update_check_enabled; then say "hydra is up to date with $up"
+  else say "hydra: update check is disabled (HYDRA_NO_UPDATE_CHECK, or update_check: false in the manifest)"; fi
+}
+
+# The detached fetch behind a launch, when the last one is older than UPDATE_CHECK_S.
+background_update_check() {
+  update_check_enabled || return 0
+  hydra_upstream >/dev/null 2>&1 || return 0
+  local last; last=$(jq -r '.checked_at // 0' "$UPDATE_STAMP" 2>/dev/null) || last=0
+  [ $(( $(now) - last )) -ge "$UPDATE_CHECK_S" ] 2>/dev/null || return 0
+  ( "$0" update --check >/dev/null 2>&1 & ) >/dev/null 2>&1
+}
+
 # hydra update: fast-forward the git checkout this script runs from. hydra is
 # symlinked into it, so the pull is the whole update; only hydra.sh needs a
 # shell reload, and the shim is a symlink into the same checkout.
 cmd_update() {
   need git
+  [ "${1:-}" != --check ] || { update_check; return; }
+  [ $# -eq 0 ] || die "usage: hydra update [--check]"
   local repo before after branch
-  repo=$(dirname "$(real_path "$0")")
+  repo=$(hydra_repo)
   git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
     die "$(contract "$repo") is not a git checkout — update hydra the way it was installed"
   [ -z "$(git -C "$repo" status --porcelain 2>/dev/null)" ] ||
@@ -918,6 +1022,7 @@ cmd_update() {
   git -C "$repo" pull --ff-only --quiet ||
     die "git pull --ff-only failed in $(contract "$repo") (branch $branch) — see the git output above"
   after=$(git -C "$repo" rev-parse HEAD)
+  hydra_upstream >/dev/null 2>&1 && stamp_update_check true   # the pull was a fetch: the window restarts
   if [ "$before" = "$after" ]; then
     say "hydra is up to date ($(git -C "$repo" rev-parse --short HEAD), $branch)"
     return 0
@@ -958,14 +1063,16 @@ hydra — many heads, one Claude Code
   hydra bin [PATH | --unset]  the real claude binary hydra execs (found on PATH at every
                               launch); pin one, or drop the pin
   hydra doctor                check the shim: installed, first on PATH, and what it runs
-  hydra update                pull the latest hydra into the checkout it runs from
+  hydra update [--check]      pull the latest hydra into the checkout it runs from;
+                              --check only fetches and says whether it is behind
 
   claude --teleport <id|url>  routed to the profile that owns the session, disabled or not;
                               paste the command from claude.ai/code as it is
 
 Environment: HYDRA_HOME (~/.hydra), HYDRA_MANIFEST, HYDRA_CLAUDE_BIN (pin the real binary),
              HYDRA_QUIET=1 (never print the routing hint; default: only on a terminal;
-             HYDRA_QUIET=0 always), HYDRA_MODEL (score for this model when no --model is passed)
+             HYDRA_QUIET=0 always), HYDRA_MODEL (score for this model when no --model is passed),
+             HYDRA_NO_UPDATE_CHECK=1 (never fetch hydra's upstream or mention being behind)
 EOF
 }
 
@@ -987,7 +1094,7 @@ case "${1:-help}" in
   exec)    shift; cmd_exec "$@" ;;
   bin)     shift; cmd_bin "$@" ;;
   doctor)  cmd_doctor ;;
-  update)  cmd_update ;;
+  update)  shift; cmd_update "$@" ;;
   help|-h|--help) cmd_help ;;
   *) if has_profile "$1"; then cmd_exec "$@"; else die "unknown command '$1' (hydra help)"; fi ;;
 esac
