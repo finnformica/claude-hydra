@@ -14,7 +14,7 @@ HYDRA="$ROOT/hydra"
 FILTER="${1:-}"
 ORIG_PATH="$PATH"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+trap 'kill_live; rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0; N=0
 
 # ---------------------------------------------------------------- harness
@@ -39,7 +39,29 @@ test() {
 
 NOW=1800000000 # a fixed "now"; resets default to well after it
 
+# Fake live runs for the launch ledger: a `sleep` whose argv[0] is "claude", as
+# hydra's `exec -a claude` leaves it. Killed at the next sandbox and at exit.
+kill_live() { [ -f "$TMP/live_pids" ] && xargs kill 2>/dev/null <"$TMP/live_pids"; : >"$TMP/live_pids"; }
+# live_run <name> [launched-at]: one running claude recorded against a profile; prints its pid
+live_run() {
+  local d="$HYDRA_HOME/cache/launches/$1" pid
+  mkdir -p "$d"
+  ( exec -a claude sleep 300 ) >/dev/null 2>&1 & pid=$!
+  printf '%s\n' "$pid" >>"$TMP/live_pids"
+  printf '%s' "${2:-$NOW}" >"$d/$pid"
+  printf '%s' "$pid"
+}
+# dead_run <name> [launched-at]: a record whose process has already exited
+dead_run() {
+  local d="$HYDRA_HOME/cache/launches/$1" pid
+  mkdir -p "$d"
+  pid=$(sh -c 'echo $$'); printf '%s' "${2:-$NOW}" >"$d/$pid"
+  printf '%s' "$pid"
+}
+live_of() { "$HYDRA" status --json --cached | jq -r --arg n "$1" '.profiles[] | select(.name == $n) | .live'; }
+
 sandbox() {
+  kill_live
   SB="$TMP/sb$N$RANDOM"
   mkdir -p "$SB/home/.claude/skills" "$SB/bin" "$SB/home/.hydra"
   export HOME="$SB/home" HYDRA_HOME="$SB/home/.hydra" HYDRA_NO_KEYCHAIN=1 HYDRA_QUIET=1 HYDRA_NOW=$NOW
@@ -152,7 +174,7 @@ with_tty() { if script --version >/dev/null 2>&1; then script -qec "$1" /dev/nul
 tool_path() {
   local t p
   mkdir -p "$SB/toolbin"
-  for t in env bash sh jq cat cut tr awk date mv rm rmdir mkdir head grep uname readlink ln chmod dirname basename ls cp wc sed shasum sha256sum; do
+  for t in env bash sh jq cat cut tr awk date mv rm rmdir mkdir head grep uname readlink ln chmod dirname basename ls cp wc sed shasum sha256sum ps; do
     p=$(command -v "$t" 2>/dev/null) && [ -x "$p" ] && ln -sf "$p" "$SB/toolbin/$t"
   done
   ln -sf "$SB/bin/curl" "$SB/toolbin/curl"
@@ -362,20 +384,38 @@ fi
 
 # ---------------------------------------------------------------- picking
 
-if test "pick: lowest max(5h, Fable) wins"; then
+if test "pick: lowest 5h + tightest weekly wins"; then
   add a; add b; add c
-  set_usage a 30 0 10; set_usage b 10 0 40; set_usage c 20 0 20
-  assert_eq "c (max 20) beats a (30) and b (40)" c "$(pick)"
-  assert_eq "score reported" "20" "$(pickj .score)"
+  set_usage a 30 0 10; set_usage b 10 0 40; set_usage c 15 0 20
+  assert_eq "c (15+20) beats a (30+10) and b (10+40)" c "$(pick)"
+  assert_eq "score reported" "35" "$(pickj .score)"
+  assert_eq "load is the score with nothing live" "35" "$(pickj .load)"
 fi
 
-if test "pick: ties within 5 points go to the lower weekly, then soonest 5h reset"; then
+if test "pick: the 5h window moves the pick even when the weeklies are higher"; then
+  # The bug this replaces: max(5h, weekly) let a's 5h climb to 75 % while b idled.
+  add a; add b
+  set_usage a 0 50 70; set_usage b 0 55 70
+  assert_eq "idle: lower weekly" a "$(pick)"
+  set_usage a 12 50 71
+  assert_eq "a's 5h at 12 → b, though both Fable weeklies read ~70" b "$(pick)"
+  set_usage a 12 50 70
+  assert_eq "opus: all-models weekly 50 vs 55, but a's 5h tips it" b "$(pick --model opus)"
+fi
+
+if test "pick: a Fable launch draws on whichever weekly is tighter"; then
+  add a; add b
+  set_usage a 0 30 70; set_usage b 0 60 20   # a: Fable-heavy; b: all-models-heavy
+  assert_eq "Fable: a is 70, b is 60" b "$(pick)"
+  assert_eq "opus: a is 30, b is 60" a "$(pick --model opus)"
+fi
+
+if test "pick: equal loads go to the lower weekly, then the soonest 5h reset"; then
   add a; add b; add c
-  set_usage a 22 60 0; set_usage b 20 30 0; set_usage c 24 30 0 "2099-01-01T00:00:00Z"
-  set_usage b 20 30 0 "2099-06-01T00:00:00Z"
-  assert_eq "same 5-point band, lower weekly wins (b/c over a)…" c "$(pick)"
-  set_usage c 24 30 0 "2099-06-01T00:00:00Z"; set_usage b 20 30 0 "2099-01-01T00:00:00Z"
-  assert_eq "…then soonest 5h reset" b "$(pick)"
+  set_usage a 40 20 0; set_usage b 20 30 0 "2099-06-01T00:00:00Z"; set_usage c 25 25 0 "2099-01-01T00:00:00Z"
+  assert_eq "b and c both 50 (a is 60): lower weekly wins" c "$(pick)"
+  set_usage c 20 30 0 "2099-06-01T00:00:00Z"; set_usage b 20 30 0 "2099-01-01T00:00:00Z"
+  assert_eq "…equal weekly: soonest 5h reset" b "$(pick)"
 fi
 
 if test "pick: the threshold sets exhausted profiles aside"; then
@@ -385,7 +425,7 @@ if test "pick: the threshold sets exhausted profiles aside"; then
   assert_contains "status says exhausted" "exhausted" "$("$HYDRA" status --cached | grep '^a ')"
   jq '.threshold = 95' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
   assert_eq "raising the threshold brings a back" a "$(pick)"
-  set_usage a 5 0 90
+  set_usage a 5 0 95
   assert_eq "Fable at the threshold is exhausted too" b "$(HYDRA_NOW=$NOW pick)"
 fi
 
@@ -433,18 +473,18 @@ fi
 if test "pick: weights"; then
   add a; add b
   set_usage a 40 0 20; set_usage b 20 0 40
-  assert_eq "equal weights: tie band → equal weekly → first by reset" a "$(pick)"
+  assert_eq "equal weights: both 60 → equal weekly → first by reset" a "$(pick)"
   jq '.weights.fable = 2' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
-  assert_eq "Fable weighted ×2: a (40 vs 40) beats b (20 vs 80)" a "$(pick)"
+  assert_eq "Fable weighted ×2: a (40+40) beats b (20+80)" a "$(pick)"
   jq '.weights.fable = 1 | .weights.session = 3' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
-  assert_eq "session weighted ×3: b (60) beats a (120)" b "$(pick)"
+  assert_eq "session weighted ×3: b (60+40) beats a (120+20)" b "$(pick)"
 fi
 
 if test "pick: model intent"; then
   add a; add b
   set_usage a 10 20 90; set_usage b 30 70 10    # a: Fable spent; b: weekly heavy
   assert_eq "Fable session → b" b "$(pick)"
-  assert_eq "opus session → a (Fable ignored, max(10,20)=20 < max(30,70))" a "$(pick --model opus)"
+  assert_eq "opus session → a (Fable ignored: 10+20 < 30+70)" a "$(pick --model opus)"
   assert_eq "--model=opus form" a "$(pick --model=opus)"
   assert_eq "full model id containing opus" a "$(pick --model claude-opus-5)"
   assert_eq "HYDRA_MODEL env" a "$(HYDRA_MODEL=sonnet pick)"
@@ -468,6 +508,84 @@ if test "pick: a profile whose fetch failed ranks after known ones"; then
   add a; add b; set_usage a 50 0 0
   rm -f "$HYDRA_HOME/cache/b.json"
   assert_eq "b (unknown) loses to a (known)" a "$(FAKE_CURL_EXIT=7 pick)"
+fi
+
+# ---------------------------------------------------------------- live runs / the tolerance band
+
+if test "live: a launch is recorded under the profile's ledger"; then
+  add a; set_usage a 0 0 0
+  "$HYDRA" exec -p hi >/dev/null
+  assert_eq "last launch stamped" "$NOW" "$(cat "$HYDRA_HOME/cache/launches/a/.last")"
+  assert_eq "the fake claude has exited, so nothing is live" "0" "$(live_of a)"
+  assert_eq "…and its record is gone" "0" "$(ls "$HYDRA_HOME/cache/launches/a" | wc -l | tr -d ' ')"
+  assert_eq "last_launch in the JSON" "$NOW" "$(statusj '.profiles[0].last_launch' --cached)"
+  "$HYDRA" exec a -p hi >/dev/null
+  assert_eq "a named launch is recorded too" "$NOW" "$(cat "$HYDRA_HOME/cache/launches/a/.last")"
+  rm -rf "$HYDRA_HOME/cache/launches"
+  "$HYDRA" exec doctor >/dev/null 2>&1 || true
+  assert_eq "a passthrough is not a run of ours" "" "$(ls "$HYDRA_HOME/cache/launches" 2>/dev/null)"
+fi
+
+if test "live: only running claude processes count"; then
+  add a; set_usage a 0 0 0
+  live_run a >/dev/null; live_run a >/dev/null; dead=$(dead_run a)
+  assert_eq "two live, one dead" "2" "$(live_of a)"
+  assert_eq "the dead record was pruned" "" "$(ls "$HYDRA_HOME/cache/launches/a/$dead" 2>/dev/null)"
+  old=$(live_run a $((NOW - 86401)))
+  assert_eq "a record older than a day is noise, even with a live pid" "2" "$(live_of a)"
+  assert_eq "…and is dropped" "" "$(ls "$HYDRA_HOME/cache/launches/a/$old" 2>/dev/null)"
+  pid=$(sh -c 'echo $$'); printf '%s' "$NOW" >"$HYDRA_HOME/cache/launches/a/$pid"
+  ( exec -a other sleep 300 ) >/dev/null 2>&1 & other=$!; printf '%s\n' "$other" >>"$TMP/live_pids"
+  printf '%s' "$NOW" >"$HYDRA_HOME/cache/launches/a/$other"
+  assert_eq "a live pid that is some other program (recycled) does not count" "2" "$(live_of a)"
+  assert_contains "status table has a LIVE column" "LIVE" "$("$HYDRA" status --cached | head -1)"
+  assert_contains "…with the count" " 2  ok" "$("$HYDRA" status --cached | grep '^a ')"
+fi
+
+if test "live: within the tolerance band, the fewest live runs win"; then
+  add a; add b; set_usage a 0 0 0; set_usage b 8 0 0
+  assert_eq "nothing live: a (0) over b (8)" a "$(pick)"
+  live_run a >/dev/null
+  assert_eq "one run on a → b, though a still reads lower" b "$(pick)"
+  assert_eq "in_band reported" "true" "$(pickj .in_band)"
+  live_run b >/dev/null; live_run b >/dev/null
+  assert_eq "two on b, one on a → a" a "$(pick)"
+  assert_contains "the hint shows the live count" "live 1" "$(HYDRA_QUIET=0 "$HYDRA" exec -p hi 2>&1 >/dev/null)"
+fi
+
+if test "live: each live run costs live_cost points"; then
+  add a; add b; set_usage a 0 0 0; set_usage b 26 0 0
+  live_run a >/dev/null; live_run a >/dev/null; live_run a >/dev/null
+  assert_eq "a reads 0 but carries 3 runs: load 15" "15" "$(pickj .load)"
+  assert_eq "b at 26 is outside the band (15 + 10), so a still" a "$(pick)"
+  jq '.live_cost = 10' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
+  assert_eq "live_cost 10: a is 30, b (26) is best and a within its band → fewest live: b" b "$(pick)"
+  jq '.live_cost = 10 | .tolerance = 2' "$HYDRA_HOME/profiles.json" >"$SB/m" && mv "$SB/m" "$HYDRA_HOME/profiles.json"
+  assert_eq "tolerance 2: a (30) is outside b's band, b by load" b "$(pick)"
+  set_usage b 29 0 0
+  assert_eq "…b at 29 vs a's 30 is within 2: b has nothing live" b "$(pick)"
+fi
+
+if test "live: a burst alternates between heads that read the same"; then
+  add a; add b; set_usage a 0 0 0; set_usage b 0 0 0
+  seq=""
+  for i in 1 2 3 4 5 6; do
+    seq="$seq$(HYDRA_NOW=$((NOW + i)) "$HYDRA" exec -p hi | sed -n 's/.*profiles\///p')"
+  done
+  assert_eq "a b a b a b: least recently launched within the band" "ababab" "$seq"
+  set_usage b 30 0 0
+  seq=""
+  for i in 7 8 9; do seq="$seq$(HYDRA_NOW=$((NOW + i)) "$HYDRA" exec -p hi | sed -n 's/.*profiles\///p')"; done
+  assert_eq "b outside the band: a every time" "aaa" "$seq"
+fi
+
+if test "live: the band is anchored on an eligible profile"; then
+  add a; add b; add c
+  set_usage a 95 0 0; set_usage b 40 0 0; set_usage c 48 0 0   # a exhausted
+  live_run b >/dev/null
+  assert_eq "a's 95 does not anchor the band; b and c are within 10 and c has nothing live" c "$(pick)"
+  "$HYDRA" disable c >/dev/null 2>&1
+  assert_eq "disabled c is not in the band either" b "$(pick)"
 fi
 
 # ---------------------------------------------------------------- exec / the claude wrapper
@@ -645,7 +763,7 @@ if test "teleport: a stale token or no network leaves the question to Claude Cod
 fi
 
 if test "teleport: a named profile, or --teleport alone, is not probed"; then
-  add a; add b; set_usage a 0 0 0; set_usage b 0 0 0
+  add a; add b; set_usage a 0 0 0; set_usage b 20 0 0   # b outside a's band, so every ordinary pick is a
   sessions b=200; : >"$FAKE_LOG"
   assert_contains "claude a --teleport id → a regardless" "dir=$HYDRA_HOME/profiles/a" "$("$HYDRA" exec a --teleport session_x)"
   assert_eq "no probe" "0" "$(probes)"

@@ -24,8 +24,9 @@ the invariants that are easy to break.
 Runtime state lives outside the repo in `$HYDRA_HOME` (default `~/.hydra`):
 `profiles.json` (the manifest — names, dirs, emails, tuning, an optional
 `claude_bin` pin; no secrets), `cache/<name>.json` (usage snapshots),
-`profiles/<name>/` (each profile's `CLAUDE_CONFIG_DIR`), and `bin/claude` (the
-shim, when installed). The default profile is `~/.claude` itself.
+`cache/launches/<name>/<pid>` (the launch ledger, below), `profiles/<name>/`
+(each profile's `CLAUDE_CONFIG_DIR`), and `bin/claude` (the shim, when
+installed). The default profile is `~/.claude` itself.
 
 ## Commands
 
@@ -135,6 +136,23 @@ hydra-ish may appear there. `die` is unaffected.
 `snapshot` tolerates an unreadable file. A launch can read a cache while a
 background refresh is writing it — this was a real bug.
 
+**Live runs come from a launch ledger, not a daemon.** A usage reading lags
+(refresh floor, plus a run that has only just started), so a burst of
+launches — an orchestrator starting several workers — would all land on the
+same profile; cloud load balancers answer the same lag by counting outstanding
+requests. `record_launch` (called in `cmd_exec` only when hydra chose or was
+given a profile, never for a passthrough or an explicit `CLAUDE_CONFIG_DIR`)
+writes `$HYDRA_HOME/cache/launches/<name>/<pid>` holding the launch time, and
+`<name>/.last` (atomic `mv`). The pid is the Claude Code process because
+`launch` `exec`s the binary in place. `live_runs` counts a record only while
+`kill -0` succeeds *and* `ps -o args=` for that pid mentions `claude` (a
+recycled pid), and only when it is younger than `LIVE_MAX_S` (a recycled pid
+that is another claude); anything else is deleted as it is read, so nothing
+accumulates and there is no sweeper. One file per launch means concurrent
+launches never rewrite each other. Two launches in the same instant still read
+the same ledger and can pick the same head; that window is milliseconds and is
+accepted. The ledger holds timestamps only.
+
 **The usage endpoint is undocumented and rate-limited.** `GET
 https://api.anthropic.com/api/oauth/usage`, headers `Authorization: Bearer`,
 `anthropic-beta: oauth-2025-04-20`, `User-Agent: claude-code/<version>` (a
@@ -200,11 +218,23 @@ with `now` and the manifest:
    `~/.claude/settings.json` → manifest `default_model` → `fable`. Anything not
    containing "fable" is a non-Fable session and the Fable bucket becomes `null`.
 3. `exhausted` = locked, or `max(s, w, f) >= threshold`.
-4. `score` = Fable: `max(s·w_session, f·w_fable)`; other: `max(s·w_session, w·w_weekly)`.
-5. Sort by: enabled first, non-exhausted first, known-before-unknown,
-   `floor(score / 5)`, weekly, 5-hour `resets`. (Exhausted profiles are ranked
-   rather than dropped so the teleport probe still reaches them; for the pick
-   this is the same winner as setting them aside.)
+4. `score` = the windows the session draws down, added. Fable:
+   `s·w_session + max(w·w_weekly, f·w_fable)`; other: `s·w_session + w·w_weekly`.
+   Not `max()`: that let the (usually larger) weekly figure hide the 5-hour
+   window, so one profile took every launch until its 5-hour window overtook
+   the other's weekly — the bug an orchestrator made obvious.
+5. `load` = `score + live × live_cost` (manifest, default 5): a run in flight
+   will consume more than the reading shows yet.
+6. `eligible` = enabled, not exhausted, known. `best` = the lowest eligible
+   load; `in_band` = eligible and `load <= best + tolerance` (manifest, default
+   10). The band is hysteresis over coarse, lagging integers.
+7. Sort by: enabled first, non-exhausted first, known-before-unknown, in-band
+   first; inside the band `live`, then `last_launch` (0 = never, so a fresh
+   profile goes first; this is the round robin that spreads a burst), then
+   `load`, weekly, 5-hour `resets`; outside the band `load`, weekly, `resets`.
+   (Exhausted profiles are ranked rather than dropped so the teleport probe
+   still reaches them; for the pick this is the same winner as setting them
+   aside.)
 
 Change the tests in `test/run.sh` under `# pick:` in step with any change here.
 
@@ -232,7 +262,12 @@ PATH (what `hydra.sh` does), so `bash -c 'claude …'` goes shim → hydra → t
 fake; `shim` prints the shim's path; `real` resolves a path the way `hydra bin`
 prints it (macOS's `/var` is `/private/var`); `with_tty` runs a command on a
 pty via `script(1)` (util-linux and BSD forms); `tool_path` builds a PATH with
-every tool hydra needs and no `claude` at all. New behaviour gets a test in
+every tool hydra needs and no `claude` at all. `live_run <name> [at]` starts a
+`sleep` whose argv[0] is `claude` (what `exec -a claude` leaves) and records it
+in the profile's ledger, so it counts as a live run until the next sandbox
+kills it; `dead_run` records a pid that has already exited; `live_of <name>`
+reads the count back from `status --json`. A fake run's stdout must be
+detached (`>/dev/null`) or a `$(…)` around the helper waits on the `sleep`. New behaviour gets a test in
 the matching section; the suite must stay green on both CI platforms — Ubuntu
 has already caught a macOS-only assumption once.
 
