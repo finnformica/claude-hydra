@@ -142,25 +142,48 @@ Code shows in `/usage`, then:
    10 minutes — counts as 0 %.
 2. Profiles at or over the threshold (90 %) or locked are set aside, unless
    *every* profile is.
-3. The score depends on the model the session will use:
-   - **Fable** — `max(session × w_session, fable × w_fable)`: the 5-hour window
-     and the Fable weekly window are both first-class; whichever binds decides.
+3. The **score** adds up the windows the session will draw down — the 5-hour
+   window plus the tighter of the weekly windows it touches:
+   - **Fable** — `session × w_session + max(weekly × w_weekly, fable × w_fable)`:
+     a Fable request counts against the 5-hour window, the all-models weekly
+     and the Fable weekly, and the higher weekly is the one that will bind.
    - **anything else** (`--model opus`, `sonnet`, …) — the Fable window is
-     irrelevant, so `max(session × w_session, weekly × w_weekly)`; a profile whose
+     irrelevant, so `session × w_session + weekly × w_weekly`; a profile whose
      Fable window is spent is a perfectly good Opus profile.
-4. Ties within 5 points go to the lower all-models weekly figure, then to the
-   soonest 5-hour reset.
+   Adding rather than taking the larger matters: a weekly figure is usually the
+   bigger number, and `max()` let it hide the 5-hour window completely, so one
+   profile took every launch until its 5-hour window had climbed past the
+   other's weekly.
+4. The **load** is the score plus `live_cost` (5) points for every run of that
+   profile still going — a session that started a minute ago has used nothing
+   the reading can show yet, so a burst of launches would otherwise all land on
+   the same profile.
+5. Every profile whose load is within `tolerance` (10) points of the best is
+   "about the same". Inside that band the pick goes to the fewest live runs,
+   then the least recently launched, then the lower load, the lower all-models
+   weekly, and the soonest 5-hour reset. Outside it, lower load wins.
+
+This is what a cloud load balancer does with servers: route by outstanding
+requests, not only by a lagging utilisation figure, and treat near-equal
+backends as equal so one point of noise does not flip the choice. Live runs
+are counted from a ledger under `~/.hydra/cache/launches/` — one file per
+launch, named by the process id, which `claude` keeps because hydra `exec`s
+it in place — and pruned as the processes exit. `hydra status` shows the
+count in its LIVE column.
 
 The model is read from `--model` in the arguments, else `$HYDRA_MODEL`, else
 the `model` in `~/.claude/settings.json`, else `default_model` in the manifest.
 
-Threshold, weights, grace and default model live in `profiles.json`:
+Threshold, weights, tolerance, live cost, grace and default model live in
+`profiles.json`:
 
 ```json
 {
   "version": 1,
   "threshold": 90,
   "weights": { "session": 1, "fable": 1, "weekly": 1 },
+  "tolerance": 10,
+  "live_cost": 5,
   "reset_grace_minutes": 10,
   "default_model": "fable",
   "profiles": {

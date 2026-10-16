@@ -19,6 +19,8 @@ set -euo pipefail
 HYDRA_HOME="${HYDRA_HOME:-$HOME/.hydra}"
 HYDRA_MANIFEST="${HYDRA_MANIFEST:-$HYDRA_HOME/profiles.json}"
 CACHE_DIR="$HYDRA_HOME/cache"
+LAUNCHES_DIR="$CACHE_DIR/launches"   # one file per live run: <profile>/<pid>, holding the launch time
+LIVE_MAX_S=86400                     # a run record older than this is noise (a reused pid), never a live run
 PROFILES_DIR="$HYDRA_HOME/profiles"
 DEFAULT_DIR="$HOME/.claude"
 SHIM_DIR="$HYDRA_HOME/bin"          # install.sh --shim links the `claude` shim here
@@ -80,7 +82,7 @@ use_keychain() { darwin && [ -z "${HYDRA_NO_KEYCHAIN:-}" ]; }
 
 # ---------------------------------------------------------------- manifest
 
-EMPTY_MANIFEST='{"version":1,"threshold":90,"weights":{"session":1,"fable":1,"weekly":1},"reset_grace_minutes":10,"default_model":"fable","profiles":{}}'
+EMPTY_MANIFEST='{"version":1,"threshold":90,"weights":{"session":1,"fable":1,"weekly":1},"tolerance":10,"live_cost":5,"reset_grace_minutes":10,"default_model":"fable","profiles":{}}'
 
 manifest() { if [ -f "$HYDRA_MANIFEST" ]; then cat "$HYDRA_MANIFEST"; else printf '%s' "$EMPTY_MANIFEST"; fi; }
 
@@ -405,6 +407,46 @@ fetch_usage() {
   rm -f "$tmp"
 }
 
+# ---------------------------------------------------------------- live runs
+
+# A usage reading lags: it is at most as fresh as the last refresh, and a run
+# that has just started has consumed nothing yet, so a burst of launches
+# (an orchestrator starting several workers) would all land on the same head.
+# Cloud load balancers solve the same lag with "least outstanding requests":
+# count what is in flight, not only what has been billed. hydra's version is a
+# ledger with one file per launch, named by pid. `launch` execs the real
+# binary in place, so the pid hydra writes *is* the Claude Code process, and
+# `kill -0` says whether the run is still going. The ps check guards against
+# a recycled pid; the age cap guards against a recycled pid that happens to be
+# another claude. Records are pruned as they are read, so nothing accumulates.
+record_launch() {
+  local d="$LAUNCHES_DIR/$1" t; t=$(now)
+  {   # bookkeeping: an unwritable $HYDRA_HOME must never stop a launch
+    mkdir -p "$d" &&
+    printf '%s' "$t" >"$d/$$" &&
+    printf '%s' "$t" >"$d/.last.$$" && mv "$d/.last.$$" "$d/.last"   # atomic, like the usage cache
+  } 2>/dev/null || true
+}
+
+run_alive() { kill -0 "$1" 2>/dev/null && ps -o args= -p "$1" 2>/dev/null | grep -q claude; }
+
+# Prints how many of a profile's recorded launches are still running.
+live_runs() {
+  local d="$LAUNCHES_DIR/$1" f pid t n=0 cutoff
+  [ -d "$d" ] || { printf '0'; return 0; }
+  cutoff=$(( $(now) - LIVE_MAX_S ))
+  for f in "$d"/[0-9]*; do
+    [ -e "$f" ] || continue
+    pid=${f##*/}; t=$(cat "$f" 2>/dev/null || printf '0')
+    if [ "${t:-0}" -gt "$cutoff" ] 2>/dev/null && run_alive "$pid"; then n=$((n + 1)); else rm -f "$f"; fi
+  done
+  printf '%s' "$n"
+}
+
+# When the profile was last launched (epoch seconds; 0 = never), for the
+# round robin inside a tolerance band.
+last_launch() { cat "$LAUNCHES_DIR/$1/.last" 2>/dev/null || printf '0'; }
+
 # jq prelude shared by snapshot/pick/status.
 JQ_LIB='
   def ts: if . == null then null
@@ -443,12 +485,13 @@ snapshot() {
             locked: ([.utilization.five_hour.locked_reason, .utilization.seven_day.locked_reason] | map(select(. != null)))}
       end' "$(claude_json "$dir")" 2>/dev/null || printf 'null')
   jq -n --arg name "$name" --arg dir "$dir" --argjson signed "$signed" --argjson disabled "$disabled" \
-    --argjson h "$hydra_cache" --argjson c "$claude_cache" --arg email "$(account_email "$dir")" "$JQ_LIB"'
+    --argjson h "$hydra_cache" --argjson c "$claude_cache" --arg email "$(account_email "$dir")" \
+    --argjson live "$(live_runs "$name")" --argjson last "$(last_launch "$name")" "$JQ_LIB"'
     ([$h, $c] | map(select(. != null)) | sort_by(.fetched_at) | last) as $u
     | ($u // {fetched_at: 0, source: null, auth: "unknown", limits: [], locked: []})
     | {
         name: $name, dir: $dir, email: $email, signed_in: $signed, disabled: $disabled,
-        fetched_at, source, auth,
+        fetched_at, source, auth, live: $live, last_launch: $last,
         locked: ((.locked // []) | length > 0),
         session: bucket(.kind == "session"),
         weekly:  bucket(.kind == "weekly_all"),
@@ -491,28 +534,46 @@ refresh() {
 
 # Ranks signed-in profiles, best first; prints the JSON array. Disabled
 # profiles are left out unless --all, when they trail every enabled one.
-#   Fable session:  score = max(session × w_session, fable × w_fable); ties → weekly
-#   other model:    score = max(session × w_session, weekly × w_weekly); Fable ignored
-#   ties within 5 points → the soonest 5-hour reset
+#   score = the windows this session draws down, added: the 5-hour window plus
+#           the tighter of the weekly windows it touches (Fable: all-models or
+#           Fable, whichever is higher; any other model: all-models only).
+#           Adding, not max(): a weekly figure is usually the larger number and
+#           max() let it hide the 5-hour window entirely, so one head took every
+#           launch until its 5-hour window overtook the other's weekly.
+#   load  = score + live runs × live_cost — a run in flight will consume more
+#           than the reading shows yet (least-outstanding-requests, as a load
+#           balancer counts them).
+#   band  = every eligible profile whose load is within `tolerance` of the best:
+#           within it the order is fewest live runs, then least recently
+#           launched (round robin), then load, weekly, soonest 5-hour reset.
+#           Outside it, by load. The band is hysteresis: readings are coarse
+#           integers that lag, so "about the same" must not flap on one point.
 #   anything at/over the threshold, or locked, ranks below everything that is not
 rank_json() {
   local intent all=false
   [ "${2:-}" = "--all" ] && all=true
   intent=$(model_label "$(model_intent "${1:-}")")
   snapshots | jq -c --argjson cfg "$(manifest)" --argjson now "$(now)" --arg intent "$intent" --argjson all "$all" "$JQ_LIB"'
+    def eligible: (.disabled or .exhausted or (.known | not)) | not;
     ($cfg.threshold // 90) as $threshold
     | (($cfg.reset_grace_minutes // 10) * 60) as $grace
     | ($cfg.weights.session // 1) as $ws
     | ($cfg.weights.fable // 1) as $wf
     | ($cfg.weights.weekly // 1) as $ww
+    | ($cfg.tolerance // 10) as $tol
+    | ($cfg.live_cost // 5) as $cost
     | ($intent == "fable") as $fable
     | map(select(.signed_in and ($all or (.disabled | not))))
     | map(. + {s: eff(.session; $grace), w: eff(.weekly; 0), f: (if $fable then eff(.fable; 0) else null end)})
     | map(. + {known: (.session != null), intent: $intent})
     | map(. + {exhausted: (.locked or (([.s, .w, .f] | map(. // 0) | max) >= $threshold))})
-    | map(. + {score: (if $fable then [(.s // 0) * $ws, (.f // 0) * $wf] else [(.s // 0) * $ws, (.w // 0) * $ww] end | max)})
-    | sort_by([(if .disabled then 1 else 0 end), (if .exhausted then 1 else 0 end),
-               (if .known then 0 else 1 end), (.score / 5 | floor), (.w // 0), (.session.resets // 0)])'
+    | map(. + {score: ((.s // 0) * $ws + (if $fable then ([(.w // 0) * $ww, (.f // 0) * $wf] | max) else (.w // 0) * $ww end))})
+    | map(. + {load: (.score + .live * $cost)})
+    | ([.[] | select(eligible) | .load] | min) as $best
+    | map(. + {in_band: ($best != null and eligible and .load <= $best + $tol)})
+    | sort_by([(if .disabled then 1 else 0 end), (if .exhausted then 1 else 0 end), (if .known then 0 else 1 end),
+               (if .in_band then 0 else 1 end), (if .in_band then .live else 0 end), (if .in_band then .last_launch else 0 end),
+               .load, (.w // 0), (.session.resets // 0)])'
 }
 
 # The profile a bare `claude` launches: one JSON object, or nothing when no
@@ -796,19 +857,19 @@ cmd_status() {
       {threshold: $threshold, now: $now, profiles: map(. + {state: state($threshold)})}'
     return 0
   fi
-  printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE STATE
+  printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %4s  %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE LIVE STATE
   snapshots | jq -r --argjson now "$(now)" --argjson threshold "$threshold" "$JQ_LIB"'
     .[] | [
       .name, (if (.email // "") == "" then "-" else .email end),
       (.session.pct // "null"), (.weekly.pct // "null"), (.fable.pct // "null"),
       (if .session.resets then (.session.resets - $now) else "null" end),
       (if .fetched_at > 0 then ($now - .fetched_at) else "null" end),
-      state($threshold)
+      .live, state($threshold)
     ] | map(tostring) | join("|")' |
-  while IFS='|' read -r name email s w f resets age state; do
-    printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %s\n' \
+  while IFS='|' read -r name email s w f resets age live state; do
+    printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %4s  %s\n' \
       "$name" "$email" "$(fmt_pct "$s")" "$(fmt_pct "$w")" "$(fmt_pct "$f")" \
-      "$(fmt_in "$resets")" "$(fmt_in "$age")" "$state"
+      "$(fmt_in "$resets")" "$(fmt_in "$age")" "$live" "$state"
   done
 }
 
@@ -870,10 +931,11 @@ cmd_exec() {
       launch "$@"
     fi
     name=$(printf '%s' "$p" | jq -r .name)
-    hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%\(if .intent == "fable" then "   Fable \(.f // "-")%" else "   (\(.intent): Fable window ignored)" end)\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
+    hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%\(if .intent == "fable" then "   Fable \(.f // "-")%" else "   (\(.intent): Fable window ignored)" end)\(if .live > 0 then "   live \(.live)" else "" end)\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
   fi
 
   background_refresh
+  record_launch "$name"   # counts as a live run from here until the process exits
   local dir; dir=$(profile_dir "$name")
   if is_default_dir "$dir"; then launch "$@"
   else export CLAUDE_CONFIG_DIR="$dir"; launch "$@"; fi
