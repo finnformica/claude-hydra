@@ -565,15 +565,21 @@ rank_json() {
     | ($intent == "fable") as $fable
     | map(select(.signed_in and ($all or (.disabled | not))))
     | map(. + {s: eff(.session; $grace), w: eff(.weekly; 0), f: (if $fable then eff(.fable; 0) else null end)})
-    | map(. + {known: (.session != null), intent: $intent})
+    # A profile is "known" once a fetch has returned real data, even when that
+    # data has no 5-hour bucket (no activity yet this window). Gate eligibility
+    # on a fetch having happened at all, not on the 5-hour bucket specifically.
+    | map(. + {known: (.fetched_at > 0), intent: $intent})
     | map(. + {exhausted: (.locked or (([.s, .w, .f] | map(. // 0) | max) >= $threshold))})
     | map(. + {score: ((.s // 0) * $ws + (if $fable then ([(.w // 0) * $ww, (.f // 0) * $wf] | max) else (.w // 0) * $ww end))})
     | map(. + {load: (.score + .live * $cost)})
     | ([.[] | select(eligible) | .load] | min) as $best
     | map(. + {in_band: ($best != null and eligible and .load <= $best + $tol)})
-    | sort_by([(if .disabled then 1 else 0 end), (if .exhausted then 1 else 0 end), (if .known then 0 else 1 end),
+    # A missing 5-hour bucket already scores as 0 (`.s // 0` above), so it must
+    # not also sink a profile below every known one. `known` breaks a tie only
+    # after load, weekly and reset — never before them.
+    | sort_by([(if .disabled then 1 else 0 end), (if .exhausted then 1 else 0 end),
                (if .in_band then 0 else 1 end), (if .in_band then .live else 0 end), (if .in_band then .last_launch else 0 end),
-               .load, (.w // 0), (.session.resets // 0)])'
+               .load, (.w // 0), (.session.resets // 0), (if .known then 0 else 1 end)])'
 }
 
 # The profile a bare `claude` launches: one JSON object, or nothing when no

@@ -145,6 +145,10 @@ add() { local n=$1 e=${2:-$1@example.com}; shift; shift 2>/dev/null || true; FAK
 # set_usage <name> <5h> <weekly> <fable> [resets…]: serve these numbers and fetch them into the cache
 set_usage() { local n=$1; shift; usage "$@" >"$SB/u-$n.json"; FAKE_CURL_BODY="$SB/u-$n.json" "$HYDRA" refresh --force "$n" >/dev/null; }
 
+# set_usage_no_session <name> <weekly> [fable]: like set_usage, but the response has
+# no session (5h) bucket at all — what the API sends for an account idle this window.
+set_usage_no_session() { local n=$1 w=$2 f=${3:-0}; usage 0 "$w" "$f" | jq 'del(.limits[0])' >"$SB/u-$n.json"; FAKE_CURL_BODY="$SB/u-$n.json" "$HYDRA" refresh --force "$n" >/dev/null; }
+
 cache() { cat "$HYDRA_HOME/cache/$1.json"; }
 
 # sessions <name>=<code>…: what the sessions endpoint answers each profile's token (others get 404)
@@ -508,6 +512,34 @@ if test "pick: a profile whose fetch failed ranks after known ones"; then
   add a; add b; set_usage a 50 0 0
   rm -f "$HYDRA_HOME/cache/b.json"
   assert_eq "b (unknown) loses to a (known)" a "$(FAKE_CURL_EXIT=7 pick)"
+fi
+
+if test "pick: a missing 5h bucket does not sink a profile below a busier known one"; then
+  # The usage API omits the session bucket for an account idle this window.
+  # That must score as 0, not drop the profile behind every known profile.
+  add work; add a; add b
+  set_usage work 60 17 0
+  set_usage_no_session a 4
+  set_usage_no_session b 1
+  assert_eq "a has no session bucket" "0" "$(cache a | jq '[.limits[] | select(.kind == "session")] | length')"
+  p=$(pick)
+  case "$p" in
+    a|b) ok "a or b wins, not work" ;;
+    *) fail "a or b wins, not work" "got [$p]" ;;
+  esac
+  assert_eq "b (weekly 1%) ranks ahead of a (weekly 4%)" b "$p"
+fi
+
+if test "pick: no session bucket but weekly at the threshold still ranks as exhausted"; then
+  add a; set_usage_no_session a 95
+  assert_eq "a is the only signed-in profile, but it is exhausted" "true" "$(pickj .exhausted)"
+fi
+
+if test "pick: with a session bucket on every profile, the order is unchanged"; then
+  add work; add a; add b
+  set_usage work 60 17 0; set_usage a 5 4 0; set_usage b 5 1 0
+  assert_eq "b (weekly 1%) still ranks ahead of a (weekly 4%)" b "$(pick)"
+  assert_eq "work (60% 5h) is not picked" "" "$(pick | grep -x work || true)"
 fi
 
 # ---------------------------------------------------------------- live runs / the tolerance band
