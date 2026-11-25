@@ -25,8 +25,8 @@ Runtime state lives outside the repo in `$HYDRA_HOME` (default `~/.hydra`):
 `profiles.json` (the manifest — names, dirs, emails, tuning, an optional
 `claude_bin` pin; no secrets), `cache/<name>.json` (usage snapshots),
 `cache/launches/<name>/<pid>` (the launch ledger, below), `profiles/<name>/`
-(each profile's `CLAUDE_CONFIG_DIR`), and `bin/claude` (the shim, when
-installed). The default profile is `~/.claude` itself.
+(each profile's `CLAUDE_CONFIG_DIR`, which may hold `.hydra-oauth-token`, below),
+and `bin/claude` (the shim, when installed). The default profile is `~/.claude` itself.
 
 ## Commands
 
@@ -65,7 +65,32 @@ therefore export precisely the string it hashes in `service_name`: the
 
 **Tokens never leave the machine.** Nothing under `$HYDRA_HOME` except the
 per-profile dirs holds a credential, and those are never copied, exported or
-committed. The manifest is designed to be shareable via dotfiles.
+committed. The manifest is designed to be shareable via dotfiles. A browser
+login stays wherever Claude Code keeps it. The one secret hydra itself keeps is
+the opt-in long-lived token (`hydra token`), stored beside that login: on macOS
+a hydra-owned Keychain item `hydra-oauth-token-<sha8 of the dir string>`
+(`hydra-oauth-token` for `~/.claude`), hashed like `service_name`; otherwise
+`<dir>/.hydra-oauth-token`, mode 600. It goes to Claude Code only as
+`CLAUDE_CODE_OAUTH_TOKEN` in the launch's environment. Never print it, log it,
+put it in argv (`store_token` feeds `security -i` on stdin), or write it
+anywhere else. `status --json` carries a `token` boolean, never the value.
+
+**A long-lived token is inference-only, so it is opt-in and never ranks.**
+`claude setup-token` asks for the scope `user:inference` alone (`inferenceOnly`
+in the 2.1.302 bundle), and with `CLAUDE_CODE_OAUTH_TOKEN` set Claude Code uses
+that token ahead of the stored login, with no refresh token. The usage
+endpoint needs `user:profile` (Claude Code's own `/usage` fetch is gated on it),
+so `fetch_usage` and the teleport probe keep reading `credentials` — the
+browser login. A token session never refreshes that login, so it goes stale;
+`state` says `token, usage stale — hydra login to refresh`. A profile with a
+token and no login is `token, usage unknown`: `rank_json` keeps it
+(`signed_in or token`) but it is not `known`, so it ranks last and is still
+launchable. Remote Control, Claude in Chrome, claude.ai MCP connectors and
+teleport refuse the token, so `needs_full_login` (any `PASSTHROUGH` subcommand,
+`--teleport`, `--remote-control`, `--chrome`) launches without it.
+`hydra token` reads `setup-token`'s TUI through `script(1)` and a pipe
+(`token_in`), checks it with one tool-less `claude -p --model haiku`, and falls
+back to a hidden paste when the screen wrapped it.
 
 **Launch never waits on the network.** `cmd_exec` picks from cached numbers and
 `exec`s; a stale cache is refreshed by a detached `( "$0" refresh … & )` after
@@ -208,9 +233,10 @@ second run. `--shim` still refuses when no real binary resolves.
 
 ## The ranking, precisely
 
-In `rank_json` (jq); `pick_json` is its first element. Per enabled, signed-in
-profile (`--all` keeps disabled ones, sorted last — the teleport probe order),
-with `now` and the manifest:
+In `rank_json` (jq); `pick_json` is its first element. Per enabled profile that
+is signed in or has a token (`--all` keeps disabled ones, sorted last — the
+teleport probe order, which then drops token-only ones), with `now` and the
+manifest:
 
 1. `eff(bucket; grace)`: a bucket whose `resets_at <= now + grace` is 0. Grace is
    `reset_grace_minutes` for the 5-hour window, 0 for the weekly ones.
@@ -225,7 +251,8 @@ with `now` and the manifest:
    the other's weekly — the bug an orchestrator made obvious.
 5. `load` = `score + live × live_cost` (manifest, default 5): a run in flight
    will consume more than the reading shows yet.
-6. `eligible` = enabled, not exhausted, known. `best` = the lowest eligible
+6. `eligible` = enabled, not exhausted, known (a fetch has happened and the
+   profile is signed in, so a token-only profile is never known). `best` = the lowest eligible
    load; `in_band` = eligible and `load <= best + tolerance` (manifest, default
    10). The band is hysteresis over coarse, lagging integers.
 7. Sort by: enabled first, non-exhausted first, known-before-unknown, in-band
@@ -242,10 +269,12 @@ Change the tests in `test/run.sh` under `# pick:` in step with any change here.
 
 Each test runs in a sandbox (`sandbox()` in `test/run.sh`): a throwaway `$HOME`
 with a fake `~/.claude`, `HYDRA_HOME` under it (so `~` contraction works), a
-fake `claude` (records args; `auth login` writes fake credentials) and a fake
+fake `claude` (records args and prints the `CLAUDE_CODE_OAUTH_TOKEN` it got;
+`auth login` writes fake credentials; `setup-token` draws `$FAKE_TOKEN` in colour;
+`-p` under a token is the token check, failing when `FAKE_TOKEN_OK=no`) and a fake
 `curl` (serves `$FAKE_CURL_BODY` with `$FAKE_CURL_CODE`) first on `PATH`,
 `HYDRA_NO_KEYCHAIN=1` so credentials are files, and `HYDRA_NOW` for a fixed
-clock. `usage <5h> <weekly> <fable> [resets…]` builds an endpoint body;
+clock. `put_token <name> [token]` stores a token the way `hydra token` does. `usage <5h> <weekly> <fable> [resets…]` builds an endpoint body;
 `set_usage <name> …` serves it and fetches it into the cache. The fake curl
 answers the sessions endpoint per bearer token from `$FAKE_SESSIONS` (a token
 not listed gets 404): `sessions a=404 b=200` writes it for the sandbox's
