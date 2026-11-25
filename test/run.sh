@@ -66,7 +66,8 @@ sandbox() {
   mkdir -p "$SB/home/.claude/skills" "$SB/bin" "$SB/home/.hydra"
   export HOME="$SB/home" HYDRA_HOME="$SB/home/.hydra" HYDRA_NO_KEYCHAIN=1 HYDRA_QUIET=1 HYDRA_NOW=$NOW
   export HYDRA_SOURCED=1   # what hydra.sh sets: the sandbox stands in for a shell that has sourced it
-  unset HYDRA_MANIFEST HYDRA_MODEL CLAUDE_CONFIG_DIR
+  unset HYDRA_MANIFEST HYDRA_MODEL CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN FAKE_TOKEN_OK
+  export FAKE_TOKEN="sk-ant-oat01-Fake_token-0123456789"
   export FAKE_LOG="$SB/fake.log" FAKE_CURL_CODE=200 FAKE_CURL_EXIT=0 FAKE_CURL_BODY="$SB/usage.json" FAKE_EMAIL="who@example.com"
   usage 0 0 0 >"$FAKE_CURL_BODY"
   printf '{"model":"claude-fable-5-1[1m]"}' >"$HOME/.claude/settings.json"
@@ -104,8 +105,11 @@ EOF
   export PATH="$SB/bin:$ORIG_PATH"
 }
 
-# fake_claude <path> <version>: a claude that prints its version, config dir and args
-# (so an "update" to a new version is visible); `auth login` writes a fake sign-in.
+# fake_claude <path> <version>: a claude that prints its version, config dir, the
+# CLAUDE_CODE_OAUTH_TOKEN it was given and its args (so an "update" to a new version
+# is visible); `auth login` writes a fake sign-in; `setup-token` draws $FAKE_TOKEN on
+# its "screen" in colour, as the real TUI does; `-p` under a token is the token check,
+# which passes only for $FAKE_TOKEN and only while FAKE_TOKEN_OK is yes.
 fake_claude() {
   cat >"$1" <<EOF
 #!/bin/sh
@@ -118,8 +122,17 @@ if [ "\$1" = "auth" ] && [ "\$2" = "login" ]; then
   printf '{"oauthAccount":{"emailAddress":"%s"}}' "\$FAKE_EMAIL" >"\$cfg"
   exit 0
 fi
+if [ "\$1" = "setup-token" ]; then
+  printf '\\033[32mLong-lived authentication token created successfully!\\033[39m\\r\\n'
+  printf 'Your OAuth token (valid for 1 year):\\r\\n\\033[33m%s\\033[39m\\r\\nStore this token securely.\\r\\n' "\$FAKE_TOKEN"
+  exit 0
+fi
+if [ "\$1" = "-p" ] && [ -n "\${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  [ "\${FAKE_TOKEN_OK:-yes}" = yes ] && [ "\$CLAUDE_CODE_OAUTH_TOKEN" = "\$FAKE_TOKEN" ]; exit \$?
+fi
 printf 'version=%s\\n' "$2"
 printf 'dir=%s\\n' "\${CLAUDE_CONFIG_DIR-<unset>}"
+printf 'oauth=%s\\n' "\${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"
 for a in "\$@"; do printf 'arg=[%s]\\n' "\$a"; done
 EOF
   chmod +x "$1"
@@ -185,6 +198,9 @@ tool_path() {
   printf '%s' "$SB/toolbin"
 }
 manifest() { cat "$HYDRA_HOME/profiles.json"; }
+# put_token <name> [token]: a stored token as hydra token leaves it (file form, mode 600)
+put_token() { local d; d=$("$HYDRA" dir "$1"); mkdir -p "$d"; ( umask 077; printf '%s' "${2:-sk-ant-oat01-$1}" >"$d/.hydra-oauth-token" ); }
+mode_of() { ls -l "$1" | cut -c1-10; }
 pick() { "$HYDRA" pick "$@"; }
 pickj() { local f=$1; shift; "$HYDRA" pick --json "$@" | jq -r "$f"; }
 statusj() { local f=$1; shift; "$HYDRA" status --json "$@" | jq -r "$f"; }
@@ -571,7 +587,7 @@ if test "live: only running claude processes count"; then
   printf '%s' "$NOW" >"$HYDRA_HOME/cache/launches/a/$other"
   assert_eq "a live pid that is some other program (recycled) does not count" "2" "$(live_of a)"
   assert_contains "status table has a LIVE column" "LIVE" "$("$HYDRA" status --cached | head -1)"
-  assert_contains "…with the count" " 2  ok" "$("$HYDRA" status --cached | grep '^a ')"
+  assert_contains "…with the count" " 2  -      ok" "$("$HYDRA" status --cached | grep '^a ')"
 fi
 
 if test "live: within the tolerance band, the fewest live runs win"; then
@@ -1262,7 +1278,7 @@ if test "status: --json state agrees with the table, row for row"; then
   same_state f "token stale — refreshes on next launch"
   same_state g ok
   assert_eq "every state is one of the documented strings" "" "$(printf '%s' "$json" | jq -r '.profiles[].state
-    | select(. as $s | ["not signed in on this machine","disabled","locked","exhausted","token stale — refreshes on next launch","no usage data yet","ok"] | index($s) == null)')"
+    | select(. as $s | ["not signed in on this machine","token, usage unknown","disabled","locked","exhausted","token, usage stale — hydra login to refresh","token stale — refreshes on next launch","no usage data yet","ok"] | index($s) == null)')"
   assert_eq "missing windows are null, not errors" "null null null" "$(printf '%s' "$json" | jq -r '.profiles[] | select(.name == "d") | "\(.session) \(.weekly) \(.fable)"')"
 fi
 
@@ -1325,6 +1341,90 @@ if test "login re-authenticates an existing profile"; then
   FAKE_EMAIL=new@example.com "$HYDRA" login w >/dev/null 2>&1
   assert_eq "email updated" "new@example.com" "$(manifest | jq -r .profiles.w.email)"
   assert_eq "usage fetched after login" "1" "$(grep -c '^curl' "$FAKE_LOG")"
+fi
+
+# ---------------------------------------------------------------- token
+
+if test "token: setup-token's screen is read, checked with one request and stored mode 600"; then
+  if ! has_tty; then skip "token capture" "no script(1)"; else
+    add a; : >"$FAKE_LOG"
+    out=$("$HYDRA" token a </dev/null 2>"$SB/err"); rc=$?
+    assert_eq "exit 0" "0" "$rc"
+    f="$HYDRA_HOME/profiles/a/.hydra-oauth-token"
+    assert_eq "the token is stored in the profile dir" "$FAKE_TOKEN" "$(cat "$f" 2>/dev/null)"
+    assert_eq "…mode 600" "-rw-------" "$(mode_of "$f")"
+    assert_eq "nothing on stdout" "" "$out"
+    assert_contains "setup-token ran under the profile" "claude setup-token" "$(cat "$FAKE_LOG")"
+    assert_contains "the check is one tool-less haiku request" "claude -p --model haiku --tools  --strict-mcp-config" "$(cat "$FAKE_LOG")"
+    assert_eq "…made once" "1" "$(grep -c '^claude -p' "$FAKE_LOG" | tr -d ' ')"
+    assert_not_contains "the token is in no argv" "$FAKE_TOKEN" "$(cat "$FAKE_LOG")"
+    assert_contains "hydra says where it went" "stored the token for 'a' in ~/.hydra/profiles/a/.hydra-oauth-token (mode 600)" "$(cat "$SB/err")"
+    assert_not_contains "hydra's own messages never carry it" "$FAKE_TOKEN" "$(grep '^stored\|^launches\|^minting' "$SB/err")"
+    assert_eq "nothing else under HYDRA_HOME holds it" "" "$(grep -rl "$FAKE_TOKEN" "$HYDRA_HOME" | grep -v "^$HYDRA_HOME/profiles/a/")"
+    assert_eq "the browser login is untouched" "true" "$(statusj '.profiles[0].signed_in' --cached)"
+  fi
+fi
+
+if test "token: a token that fails the check is not stored"; then
+  add a
+  FAKE_TOKEN_OK=no "$HYDRA" token a </dev/null >/dev/null 2>"$SB/err"; rc=$?
+  assert_eq "exit non-zero" "1" "$rc"
+  assert_eq "no file" "" "$(ls -A "$HYDRA_HOME/profiles/a" | grep hydra-oauth-token)"
+  assert_contains "it says nothing was stored" "nothing stored" "$(cat "$SB/err")"
+  assert_fails "an unknown profile dies" "$HYDRA" token nobody
+  assert_fails "no name dies" "$HYDRA" token
+fi
+
+if test "token: a launch exports it for that process only; a caller's token or config dir wins"; then
+  add a; add b; set_usage a 1 1 1; set_usage b 50 50 50; put_token a
+  out=$("$HYDRA" exec a x)
+  assert_contains "claude a gets the token" "oauth=sk-ant-oat01-a" "$out"
+  assert_contains "…in a's config dir" "dir=$HYDRA_HOME/profiles/a" "$out"
+  assert_contains "a bare launch that picks a gets it too" "oauth=sk-ant-oat01-a" "$("$HYDRA" exec x)"
+  assert_contains "b has none" "oauth=<unset>" "$("$HYDRA" exec b x)"
+  assert_contains "a caller-set token wins" "oauth=mine" "$(CLAUDE_CODE_OAUTH_TOKEN=mine "$HYDRA" exec a x)"
+  assert_contains "an explicit CLAUDE_CONFIG_DIR wins: no token" "oauth=<unset>" "$(CLAUDE_CONFIG_DIR="$SB/own" "$HYDRA" exec x)"
+  assert_contains "teleport needs the full login" "oauth=<unset>" "$("$HYDRA" exec a --teleport)"
+  assert_contains "…so does Remote Control" "oauth=<unset>" "$("$HYDRA" exec a --remote-control)"
+  assert_contains "…and Claude in Chrome" "oauth=<unset>" "$("$HYDRA" exec a --chrome)"
+  assert_contains "a claude subcommand acts on the login" "oauth=<unset>" "$("$HYDRA" exec a auth status)"
+  assert_not_contains "never in argv" "sk-ant-oat01-a" "$(cat "$FAKE_LOG")"
+  assert_contains "the hint of a bare launch says so" "   token" "$(HYDRA_QUIET=0 "$HYDRA" exec x 2>&1 >/dev/null)"
+fi
+
+if test "token: status shows it; a token-only profile is 'usage unknown' yet launchable"; then
+  add a; add c "" --no-login; set_usage a 10 10 10; put_token c
+  table=$("$HYDRA" status --cached)
+  assert_contains "TOKEN column" "LIVE  TOKEN  STATE" "$table"
+  assert_contains "a: no token" "-      ok" "$(printf '%s' "$table" | grep '^a ')"
+  assert_contains "c: token, usage unknown" "yes    token, usage unknown" "$(printf '%s' "$table" | grep '^c ')"
+  assert_eq "json: token flags" "false true" "$(statusj '[.profiles[].token | tostring] | join(" ")' --cached)"
+  assert_eq "json: state" "token, usage unknown" "$(statusj '.profiles[] | select(.name == "c") | .state' --cached)"
+  assert_eq "nothing secret in the document" "0" "$("$HYDRA" status --json --cached | grep -c 'sk-ant-oat' | tr -d ' ')"
+  assert_eq "a profile with usage still wins the pick" "a" "$(pick)"
+  rm -f "$HYDRA_HOME/profiles/a/.credentials.json"
+  assert_eq "with no browser login left, the token-only profile is picked" "c" "$(pick)"
+  assert_contains "…and launched with its token" "oauth=sk-ant-oat01-c" "$("$HYDRA" exec x)"
+  add d; set_usage d 1 1 1; put_token d; FAKE_CURL_CODE=401 "$HYDRA" refresh --force d >/dev/null
+  assert_eq "a token profile whose login lapsed says what will fix it" "token, usage stale — hydra login to refresh" \
+    "$(statusj '.profiles[] | select(.name == "d") | .state' --cached)"
+fi
+
+if test "token: --remove drops only the token; remove takes it with the profile"; then
+  add a; put_token a
+  "$HYDRA" token a --remove >/dev/null 2>"$SB/err"
+  assert_eq "the token is gone" "" "$(ls -A "$HYDRA_HOME/profiles/a" | grep hydra-oauth-token)"
+  assert_contains "…said so" "dropped the token for 'a'" "$(cat "$SB/err")"
+  assert_ok "the profile stays" "$HYDRA" has a
+  assert_eq "…signed in" "true" "$(statusj '.profiles[0].signed_in' --cached)"
+  assert_contains "a second --remove is a no-op" "'a' has no token" "$("$HYDRA" token a --remove 2>&1)"
+  put_token a; "$HYDRA" remove a >/dev/null 2>&1
+  assert_eq "remove deletes the dir, token and all" "" "$(ls "$HYDRA_HOME/profiles" 2>/dev/null)"
+  add personal "" --existing; put_token personal
+  assert_eq "the default profile's token lives in ~/.claude" "sk-ant-oat01-personal" "$(cat "$HOME/.claude/.hydra-oauth-token")"
+  "$HYDRA" remove personal >/dev/null 2>&1
+  assert_eq "remove drops it there too" "" "$(ls -A "$HOME/.claude" | grep hydra-oauth-token)"
+  assert_ok "…and leaves ~/.claude itself" [ -d "$HOME/.claude/skills" ]
 fi
 
 printf '\n# %d passed, %d failed\n' "$PASS" "$FAIL"

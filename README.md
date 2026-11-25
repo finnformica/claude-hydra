@@ -107,11 +107,12 @@ shim is ever launched by hydra itself it stops with exit 70 instead of looping.
 |---|---|
 | `hydra add <name> [--existing \| --dir PATH] [--no-login]` | new profile; `--existing` registers `~/.claude` itself |
 | `hydra login <name>` | sign in, or sign in again when a token has expired |
-| `hydra remove <name> [--keep-files]` | delete the profile, its Keychain entry and its directory |
+| `hydra token <name> [--remove]` | opt in to a long-lived token for this profile (see [Long-lived tokens](#long-lived-tokens-opt-in)); `--remove` drops only the token |
+| `hydra remove <name> [--keep-files]` | delete the profile, its Keychain entry, its token and its directory |
 | `hydra rename <old> <new>` | relabel a profile; its sign-in is untouched |
 | `hydra disable <name>` · `hydra enable <name>` | keep a profile signed in but out of the rotation (`claude <name>` still works) |
 | `hydra list` | profiles and their config dirs |
-| `hydra status [--cached\|--force] [--json]` | usage table; refreshes anything older than 3 minutes. `--json` prints the same rows (every profile, all three windows, plus `state`) as one JSON document for scripts |
+| `hydra status [--cached\|--force] [--json]` | usage table; refreshes anything older than 3 minutes. The `TOKEN` column says which profiles have a long-lived token. `--json` prints the same rows (every profile, all three windows, `token`, plus `state`) as one JSON document for scripts |
 | `hydra refresh [names…] [--force]` | fetch usage now (every profile, disabled ones included, unless names are given) |
 | `hydra pick [--json] [--model M]` | which profile a bare `claude` (or `claude --model M`) would use right now |
 | `hydra link [names…] [--force]` | (re)apply the shared-config symlinks |
@@ -225,13 +226,48 @@ it launches the best of those and lets Claude Code report. A named profile
 (`claude work --teleport …`) and `--teleport` with no id (Claude's picker)
 skip the probe. This is the one launch that waits on the network.
 
+### Long-lived tokens (opt-in)
+
+A browser login's refresh token rotates on every refresh. Several sessions on
+one profile can refresh with a stale copy and revoke the login.
+`claude setup-token` makes a one-year token that does not rotate.
+`hydra token work` runs it for the `work` profile, reads the token from its
+screen, checks it with one small `claude -p` request, and stores it. From then
+on, every launch on `work` gets `CLAUDE_CODE_OAUTH_TOKEN` in its environment.
+
+- **Storage.** On macOS: a hydra-owned Keychain item, `hydra-oauth-token-<first
+  8 hex of sha256(CLAUDE_CONFIG_DIR)>` (`hydra-oauth-token` for `~/.claude`).
+  On Linux, or with `HYDRA_NO_KEYCHAIN=1`: `<config dir>/.hydra-oauth-token`,
+  mode 600. hydra never prints the token, never puts it in argv and never
+  writes it anywhere else. `setup-token` itself shows it once on its own screen.
+- **What you give up.** The token has only the `user:inference` scope. A
+  session that runs on it has no claude.ai MCP connectors, an empty `/usage`,
+  and no Remote Control, Claude in Chrome or teleport. So hydra does not give
+  the token to `--teleport`, `--remote-control`, `--chrome` or Claude's own
+  subcommands (`claude work auth …`). Those use the browser login.
+- **Ranking still needs the browser login.** The usage endpoint needs the
+  `user:profile` scope, so hydra reads usage with the browser login, as before.
+  A token session never refreshes that login. When it lapses, `status` shows
+  `token, usage stale — hydra login to refresh`. A profile with a token and no
+  browser login shows `token, usage unknown`. It ranks after every profile with
+  usage data, but `claude work` and a bare `claude` with nothing better still
+  launch it.
+- **Precedence.** A `CLAUDE_CODE_OAUTH_TOKEN` or `CLAUDE_CONFIG_DIR` that the
+  caller sets wins, as before.
+- `hydra token work --remove` drops the token and keeps the profile and its
+  browser login. `hydra remove work` drops it with the profile.
+
+If the terminal is too narrow, the token wraps and hydra cannot read it. hydra
+then asks you to paste it (the input is hidden).
+
 ## Two machines, zero token sync
 
 `profiles.json` holds names, directories and emails — nothing secret — so it
 can live in your dotfiles (`HYDRA_MANIFEST=~/dotfiles/hydra.json`). Tokens
 never leave the machine: each laptop signs in to each profile once with
 `hydra login <name>`, and `hydra status` shows `not signed in on this machine`
-for any profile that laptop hasn't logged into yet.
+for any profile that laptop hasn't logged into yet. A long-lived token from
+`hydra token` stays on the machine that made it, beside the browser login.
 
 ## How it works
 
@@ -273,7 +309,9 @@ for any profile that laptop hasn't logged into yet.
 - When an idle profile's access token lapses the usage call returns 401; hydra
   keeps the last numbers (marked `token stale`) and Claude Code refreshes the
   token itself the next time that profile launches. Only an expired *refresh*
-  token needs `hydra login <name>`.
+  token needs `hydra login <name>`. A profile with a long-lived token never
+  launches on its browser login, so that login is not refreshed and needs
+  `hydra login <name>` when its usage goes stale.
 - If the same account is used on two machines, each machine's cache only knows
   what it fetched; the reset-time decay keeps it from being pessimistic, and
   the next launch refreshes it.

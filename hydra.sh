@@ -46,7 +46,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
   _hydra() {
     local -a cmds
     cmds=(
-      'add:new profile' 'login:sign in / re-authenticate' 'remove:delete a profile'
+      'add:new profile' 'login:sign in / re-authenticate' 'token:store a long-lived token for a profile' 'remove:delete a profile'
       'rename:relabel a profile' 'enable:put a profile back in the rotation' 'disable:take a profile out of the rotation' 'list:profiles and config dirs' 'status:usage per profile'
       'refresh:fetch usage now' 'pick:which profile a bare claude would use'
       'link:reapply shared-config symlinks' 'dir:print a config dir' 'exec:launch claude on a profile'
@@ -61,6 +61,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
     else
       case "${words[2]}" in
         login|remove|rm|rename|enable|disable|dir|has|refresh|link|exec) _hydra_profiles ;;
+        token) if (( CURRENT == 3 )); then _hydra_profiles; else compadd -- --remove; fi ;;
         add) [[ "${words[CURRENT]}" == -* ]] && compadd -- --existing --dir --no-login ;;
         status) compadd -- --cached --force --json ;;
         bin) compadd -- --unset; _files ;;
@@ -83,13 +84,16 @@ if [ -n "${ZSH_VERSION:-}" ]; then
 elif [ -n "${BASH_VERSION:-}" ]; then
   _hydra_bash() {
     local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
-    local cmds="add login remove rename enable disable list status refresh pick link dir exec bin doctor update help"
+    local cmds="add login token remove rename enable disable list status refresh pick link dir exec bin doctor update help"
     if [ "$COMP_CWORD" -eq 1 ]; then
       COMPREPLY=($(compgen -W "$cmds $(hydra names 2>/dev/null)" -- "$cur"))
     else
       case "$cmd" in
         login|remove|rm|rename|enable|disable|dir|has|refresh|link|exec)
           COMPREPLY=($(compgen -W "$(hydra names 2>/dev/null)" -- "$cur")) ;;
+        token)
+          if [ "$COMP_CWORD" -eq 2 ]; then COMPREPLY=($(compgen -W "$(hydra names 2>/dev/null)" -- "$cur"))
+          else COMPREPLY=($(compgen -W "--remove" -- "$cur")); fi ;;
         status) COMPREPLY=($(compgen -W "--cached --force --json" -- "$cur")) ;;
         *) COMPREPLY=($(compgen -f -- "$cur")) ;;
       esac

@@ -11,8 +11,10 @@
 #   claude work --resume     launch on a named profile
 #
 # State lives in $HYDRA_HOME (default ~/.hydra); nothing secret is written
-# there — tokens stay wherever Claude Code keeps them (the macOS Keychain, or
-# <config dir>/.credentials.json on Linux).
+# there outside the profile dirs. A browser login stays wherever Claude Code
+# keeps it (the macOS Keychain, or <config dir>/.credentials.json on Linux);
+# an opt-in long-lived token (hydra token) sits beside it, in a hydra-owned
+# Keychain item or <config dir>/.hydra-oauth-token.
 
 set -euo pipefail
 
@@ -37,7 +39,7 @@ SHARED_FILES="settings.json CLAUDE.md history.jsonl"
 
 # Claude's own subcommands: never routed unless a profile is named first.
 PASSTHROUGH="agents attach auth auto-mode doctor gateway import install logs mcp plugin plugins project respawn rm setup-token stop kill ultrareview update upgrade"
-HYDRA_CMDS="add login remove rm rename enable disable list ls names link status refresh pick dir has exec bin doctor update help"
+HYDRA_CMDS="add login token remove rm rename enable disable list ls names link status refresh pick dir has exec bin doctor update help"
 RESERVED="auto best $HYDRA_CMDS $PASSTHROUGH"
 
 # ---------------------------------------------------------------- utilities
@@ -130,6 +132,58 @@ credentials() {
 }
 
 signed_in() { credentials "$1" >/dev/null 2>&1; }
+
+# A long-lived token from `claude setup-token` (opt-in, per profile). Claude Code
+# never stores it, so hydra does: a hydra-owned Keychain item named after the
+# dir the way Claude Code names its own, or a mode-600 file in the profile dir.
+# It reaches Claude Code only as CLAUDE_CODE_OAUTH_TOKEN in a launch's
+# environment — never argv, never a file under $HYDRA_HOME outside the dir.
+TOKEN_FILE=".hydra-oauth-token"
+token_service() {
+  if is_default_dir "$1"; then printf 'hydra-oauth-token'
+  else printf 'hydra-oauth-token-%s' "$(sha8 "$1")"; fi
+}
+
+stored_token() {
+  local dir="$1"
+  if use_keychain; then
+    security find-generic-password -s "$(token_service "$dir")" -w 2>/dev/null && return 0
+  fi
+  [ -s "$dir/$TOKEN_FILE" ] && cat "$dir/$TOKEN_FILE"
+}
+
+has_token() { stored_token "$1" >/dev/null 2>&1; }
+
+# Reads the token from stdin. `security -i` takes its command on stdin, so the
+# token is never in an argv that `ps` could show.
+store_token() {
+  local dir="$1" tok tmp; IFS= read -r tok
+  if use_keychain; then
+    printf 'add-generic-password -U -a "%s" -s "%s" -w "%s"\n' "${USER:-hydra}" "$(token_service "$dir")" "$tok" |
+      security -i >/dev/null 2>&1
+  else
+    mkdir -p "$dir"; tmp="$dir/$TOKEN_FILE.tmp.$$"
+    ( umask 077; printf '%s' "$tok" >"$tmp" ) && chmod 600 "$tmp" && mv "$tmp" "$dir/$TOKEN_FILE"
+  fi
+}
+
+drop_token() {
+  local dir="$1"
+  if use_keychain; then security delete-generic-password -s "$(token_service "$dir")" >/dev/null 2>&1 || true; fi
+  rm -f "$dir/$TOKEN_FILE"
+}
+
+# A setup-token token is inference-only (scope user:inference): Remote Control,
+# Claude in Chrome and teleport refuse it, and Claude Code's own subcommands
+# (auth, setup-token, …) act on the login. These launches keep the full login.
+needs_full_login() {
+  case " $PASSTHROUGH " in *" ${1:-} "*) return 0 ;; esac
+  local a
+  for a in "$@"; do
+    case "$a" in --teleport|--teleport=*|--remote-control|--remote-control=*|--chrome) return 0 ;; esac
+  done
+  return 1
+}
 
 # Claude keeps the default profile's state file *beside* ~/.claude, not inside it.
 claude_json() { if is_default_dir "$1"; then printf '%s/.claude.json' "$HOME"; else printf '%s/.claude.json' "$1"; fi; }
@@ -461,11 +515,14 @@ JQ_LIB='
   # Why a profile is (or is not) usable, first reason wins. The status table and
   # `status --json` both read it from here so the two can never disagree.
   def state($threshold):
-    if (.signed_in | not) then "not signed in on this machine"
+    # A token launches but cannot read usage (it lacks user:profile), so a
+    # profile with one and no browser login is launchable but unranked.
+    if (.signed_in | not) then (if .token then "token, usage unknown" else "not signed in on this machine" end)
     elif .disabled then "disabled"
     elif .locked then "locked"
     elif ([.session.pct, .weekly.pct, .fable.pct] | map(. // 0) | max) >= $threshold then "exhausted"
-    elif .auth == "stale" then "token stale — refreshes on next launch"
+    # Token launches never refresh the browser login, so only a sign-in will.
+    elif .auth == "stale" then (if .token then "token, usage stale — hydra login to refresh" else "token stale — refreshes on next launch" end)
     elif .session == null then "no usage data yet"
     else "ok" end;
 '
@@ -473,9 +530,10 @@ JQ_LIB='
 # One normalised usage record per profile, from whichever is newer: hydra'"'"'s
 # own cache or the snapshot Claude Code writes after each session.
 snapshot() {
-  local name="$1" dir hydra_cache claude_cache signed disabled
+  local name="$1" dir hydra_cache claude_cache signed disabled token
   dir=$(profile_dir "$name")
   signed=false; signed_in "$dir" && signed=true
+  token=false; has_token "$dir" && token=true
   disabled=false; profile_disabled "$name" && disabled=true
   hydra_cache=$(jq -c . "$CACHE_DIR/$name.json" 2>/dev/null || printf 'null')
   claude_cache=$(jq -c '.cachedUsageUtilization // null
@@ -484,13 +542,13 @@ snapshot() {
             limits: (.utilization.limits // []),
             locked: ([.utilization.five_hour.locked_reason, .utilization.seven_day.locked_reason] | map(select(. != null)))}
       end' "$(claude_json "$dir")" 2>/dev/null || printf 'null')
-  jq -n --arg name "$name" --arg dir "$dir" --argjson signed "$signed" --argjson disabled "$disabled" \
+  jq -n --arg name "$name" --arg dir "$dir" --argjson signed "$signed" --argjson disabled "$disabled" --argjson token "$token" \
     --argjson h "$hydra_cache" --argjson c "$claude_cache" --arg email "$(account_email "$dir")" \
     --argjson live "$(live_runs "$name")" --argjson last "$(last_launch "$name")" "$JQ_LIB"'
     ([$h, $c] | map(select(. != null)) | sort_by(.fetched_at) | last) as $u
     | ($u // {fetched_at: 0, source: null, auth: "unknown", limits: [], locked: []})
     | {
-        name: $name, dir: $dir, email: $email, signed_in: $signed, disabled: $disabled,
+        name: $name, dir: $dir, email: $email, signed_in: $signed, disabled: $disabled, token: $token,
         fetched_at, source, auth, live: $live, last_launch: $last,
         locked: ((.locked // []) | length > 0),
         session: bucket(.kind == "session"),
@@ -563,12 +621,13 @@ rank_json() {
     | ($cfg.tolerance // 10) as $tol
     | ($cfg.live_cost // 5) as $cost
     | ($intent == "fable") as $fable
-    | map(select(.signed_in and ($all or (.disabled | not))))
+    | map(select((.signed_in or .token) and ($all or (.disabled | not))))
     | map(. + {s: eff(.session; $grace), w: eff(.weekly; 0), f: (if $fable then eff(.fable; 0) else null end)})
     # A profile is "known" once a fetch has returned real data, even when that
     # data has no 5-hour bucket (no activity yet this window). Gate eligibility
     # on a fetch having happened at all, not on the 5-hour bucket specifically.
-    | map(. + {known: (.fetched_at > 0), intent: $intent})
+    # A token-only profile (no browser login) has no usage of its own to trust.
+    | map(. + {known: (.signed_in and .fetched_at > 0), intent: $intent})
     | map(. + {exhausted: (.locked or (([.s, .w, .f] | map(. // 0) | max) >= $threshold))})
     | map(. + {score: ((.s // 0) * $ws + (if $fable then ([(.w // 0) * $ww, (.f // 0) * $wf] | max) else (.w // 0) * $ww end))})
     | map(. + {load: (.score + .live * $cost)})
@@ -641,7 +700,7 @@ probe_word() { case "$1" in 200) printf 'owns it' ;; 404) printf 'not found' ;; 
 teleport_route() {
   local id="$1" model="${2:-}" n code owner="" open="" disabled="" notes=""
   CLAUDE_VERSION=$(claude_version); export CLAUDE_VERSION
-  for n in $(rank_json "$model" --all | jq -r '.[].name'); do
+  for n in $(rank_json "$model" --all | jq -r '.[] | select(.signed_in) | .name'); do
     code=$(probe_session "$(profile_dir "$n")" "$id")
     case "$code" in
       200) owner="$n"; break ;;
@@ -776,6 +835,7 @@ cmd_remove() {
   [ -n "$name" ] || die "usage: hydra remove <name> [--keep-files]"
   require_profile "$name"
   local dir; dir=$(profile_dir "$name")
+  drop_token "$dir"   # hydra's own secret: it goes with the profile, default or not
 
   if is_default_dir "$dir"; then
     say "'$name' is your default ~/.claude — forgetting it, leaving the sign-in alone"
@@ -792,6 +852,66 @@ cmd_remove() {
   rm -f "$CACHE_DIR/$name.json"
   manifest | jq --arg n "$name" 'del(.profiles[$n])' | save_manifest
   say "removed '$name'"
+}
+
+# claude setup-token draws its token in a TUI and saves it nowhere, so hydra
+# runs it on a pseudo-terminal (script(1)) and reads the screen through a pipe;
+# the user sees the same screen on stderr. Prints the screen on stdout.
+setup_token_screen() {
+  local dir="$1" bin q; bin=$(claude_bin)
+  is_default_dir "$dir" || { CLAUDE_CONFIG_DIR="$dir"; export CLAUDE_CONFIG_DIR; }
+  if ! command -v script >/dev/null 2>&1; then "$bin" setup-token >&2; return 0; fi
+  if script --version >/dev/null 2>&1; then   # util-linux: the command is one shell string
+    q=$(printf '%s' "$bin" | sed "s/'/'\\\\''/g")
+    script -qec "'$q' setup-token" /dev/null
+  else script -q /dev/null "$bin" setup-token; fi | tee /dev/stderr
+}
+
+# The longest sk-ant-oat… run on that screen, terminal escapes and CRs removed.
+token_in() {
+  local esc; esc=$(printf '\033')
+  tr -d '\r' | LC_ALL=C sed "s|$esc\[[0-9;?]*[ -/]*[@-~]||g" | LC_ALL=C grep -o 'sk-ant-oat[A-Za-z0-9_-]*' |
+    awk '{ if (length($0) > length(t)) t = $0 } END { if (t != "") print t }'
+}
+
+valid_token() { case "$1" in sk-ant-oat?*) [ -z "$(printf '%s' "$1" | LC_ALL=C tr -d 'A-Za-z0-9_-')" ] ;; *) return 1 ;; esac; }
+
+# One cheap real request with the token alone: a one-word, tool-less `claude -p`
+# on the cheapest model, the token in the environment and nowhere else.
+token_works() {
+  local dir="$1" tok="$2"
+  CLAUDE_CODE_OAUTH_TOKEN="$tok" run_claude "$dir" -p --model haiku --tools "" --strict-mcp-config \
+    --no-session-persistence --disable-slash-commands 'Reply with the word OK.' </dev/null >/dev/null 2>&1
+}
+
+# hydra token <name>            mint a long-lived token (claude setup-token), check it, store it
+# hydra token <name> --remove   drop it; the profile and its browser login stay
+cmd_token() {
+  local name="" drop=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --remove) drop=1 ;; -*) die "unknown option $1" ;; *) [ -z "$name" ] && name="$1" || die "unexpected argument $1" ;; esac; shift
+  done
+  [ -n "$name" ] || die "usage: hydra token <name> [--remove]"
+  require_profile "$name"
+  local dir tok=""; dir=$(profile_dir "$name")
+  if [ "$drop" -eq 1 ]; then
+    if has_token "$dir"; then drop_token "$dir"; say "dropped the token for '$name' (its browser login is untouched)"
+    else say "'$name' has no token"; fi
+    return 0
+  fi
+  say "minting a long-lived token for '$name' (claude setup-token)…"
+  tok=$( { setup_token_screen "$dir" || true; } | token_in) || tok=""   # its exit status is not the verdict; the check is
+  if ! valid_token "$tok" || ! token_works "$dir" "$tok"; then
+    say "could not read a working token from setup-token's screen (a narrow terminal wraps it)."
+    printf 'paste the token setup-token printed (input hidden): ' >&2
+    IFS= read -rs tok || tok=""; printf '\n' >&2
+    valid_token "$tok" || die "that is not a setup-token token (sk-ant-oat…); nothing stored"
+    token_works "$dir" "$tok" || die "the token did not work with one request; nothing stored (hydra token $name to retry)"
+  fi
+  printf '%s\n' "$tok" | store_token "$dir"
+  if use_keychain; then say "stored the token for '$name' in the Keychain ($(token_service "$dir"))"
+  else say "stored the token for '$name' in $(contract "$dir")/$TOKEN_FILE (mode 600)"; fi
+  say "launches on '$name' now use it; usage still comes from its browser login (hydra token $name --remove to drop it)"
 }
 
 cmd_rename() {
@@ -863,19 +983,19 @@ cmd_status() {
       {threshold: $threshold, now: $now, profiles: map(. + {state: state($threshold)})}'
     return 0
   fi
-  printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %4s  %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE LIVE STATE
+  printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %4s  %-5s  %s\n' PROFILE ACCOUNT 5H WEEK FABLE '5H-RESET' AGE LIVE TOKEN STATE
   snapshots | jq -r --argjson now "$(now)" --argjson threshold "$threshold" "$JQ_LIB"'
     .[] | [
       .name, (if (.email // "") == "" then "-" else .email end),
       (.session.pct // "null"), (.weekly.pct // "null"), (.fable.pct // "null"),
       (if .session.resets then (.session.resets - $now) else "null" end),
       (if .fetched_at > 0 then ($now - .fetched_at) else "null" end),
-      .live, state($threshold)
+      .live, (if .token then "yes" else "-" end), state($threshold)
     ] | map(tostring) | join("|")' |
-  while IFS='|' read -r name email s w f resets age live state; do
-    printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %4s  %s\n' \
+  while IFS='|' read -r name email s w f resets age live token state; do
+    printf '%-16s %-30s %5s %5s %6s  %-8s %-6s %4s  %-5s  %s\n' \
       "$name" "$email" "$(fmt_pct "$s")" "$(fmt_pct "$w")" "$(fmt_pct "$f")" \
-      "$(fmt_in "$resets")" "$(fmt_in "$age")" "$live" "$state"
+      "$(fmt_in "$resets")" "$(fmt_in "$age")" "$live" "$token" "$state"
   done
 }
 
@@ -937,12 +1057,17 @@ cmd_exec() {
       launch "$@"
     fi
     name=$(printf '%s' "$p" | jq -r .name)
-    hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%\(if .intent == "fable" then "   Fable \(.f // "-")%" else "   (\(.intent): Fable window ignored)" end)\(if .live > 0 then "   live \(.live)" else "" end)\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
+    hint "$(printf '%s' "$p" | jq -r '"hydra → \(.name)   5h \(.s // "-")%   week \(.w // "-")%\(if .intent == "fable" then "   Fable \(.f // "-")%" else "   (\(.intent): Fable window ignored)" end)\(if .live > 0 then "   live \(.live)" else "" end)\(if .token then "   token" else "" end)\(if .exhausted then "   (everything is near its limit)" else "" end)"')"
   fi
 
   background_refresh
   record_launch "$name"   # counts as a live run from here until the process exits
-  local dir; dir=$(profile_dir "$name")
+  local dir tok=""; dir=$(profile_dir "$name")
+  # The profile's token, for this process only; a caller's own token wins.
+  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && ! needs_full_login "$@"; then
+    tok=$(stored_token "$dir" 2>/dev/null) || tok=""
+    [ -z "$tok" ] || { CLAUDE_CODE_OAUTH_TOKEN="$tok"; export CLAUDE_CODE_OAUTH_TOKEN; }
+  fi
   if is_default_dir "$dir"; then launch "$@"
   else export CLAUDE_CONFIG_DIR="$dir"; launch "$@"; fi
 }
@@ -1004,6 +1129,9 @@ hydra — many heads, one Claude Code
   hydra add <name> [--existing | --dir PATH] [--no-login]
                               new profile (--existing registers ~/.claude itself)
   hydra login <name>          sign in / re-authenticate a profile
+  hydra token <name> [--remove]
+                              mint and store a long-lived token (claude setup-token) that
+                              launches on this profile use; --remove drops just the token
   hydra remove <name> [--keep-files]
   hydra rename <old> <new>    relabel a profile (its sign-in is untouched)
   hydra disable <name>        keep it signed in but out of the rotation
@@ -1040,6 +1168,7 @@ EOF
 case "${1:-help}" in
   add)     shift; cmd_add "$@" ;;
   login)   shift; cmd_login "$@" ;;
+  token)   shift; cmd_token "$@" ;;
   remove|rm) shift; cmd_remove "$@" ;;
   rename)  shift; cmd_rename "$@" ;;
   enable)  shift; cmd_enable "$@" ;;
