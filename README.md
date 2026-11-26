@@ -245,13 +245,27 @@ on, every launch on `work` gets `CLAUDE_CODE_OAUTH_TOKEN` in its environment.
   and no Remote Control, Claude in Chrome or teleport. So hydra does not give
   the token to `--teleport`, `--remote-control`, `--chrome` or Claude's own
   subcommands (`claude work auth …`). Those use the browser login.
-- **Ranking still needs the browser login.** The usage endpoint needs the
-  `user:profile` scope, so hydra reads usage with the browser login, as before.
-  A token session never refreshes that login. When it lapses, `status` shows
-  `token, usage stale — hydra login to refresh`. A profile with a token and no
-  browser login shows `token, usage unknown`. It ranks after every profile with
-  usage data, but `claude work` and a bare `claude` with nothing better still
-  launch it.
+- **Usage comes from the browser login, or from the token.** The usage
+  endpoint needs the `user:profile` scope, so hydra reads usage with the
+  browser login when it can. When the profile has no browser login, or the
+  endpoint answers 401, hydra sends one small request on the token instead:
+  `claude -p --output-format stream-json`, no tools, no session file, no
+  settings, a one-line prompt. Claude Code reports the rate-limit headers of
+  that reply as a `rate_limit_event`, with the 5-hour and weekly use as
+  fractions. A Fable request also carries the Fable weekly window, so the
+  request uses Fable when the session intent is Fable, and haiku otherwise.
+  hydra writes the same cache record as the endpoint does, with
+  `source: "token"`. The profile then shows `ok` or `exhausted` and ranks like
+  any other.
+- **When the probe runs.** Only in `hydra refresh` and in the background
+  refresh after a launch, never in the launch itself, in `status` or in
+  `pick`. Each profile is probed at most once in 3 minutes, `--force` included,
+  failures included.
+- **When the probe fails.** A profile with no browser login shows
+  `token, usage unknown`. It ranks after every profile with usage data, but
+  `claude work` and a bare `claude` with nothing better still launch it. A
+  profile whose browser login answered 401 shows
+  `token, usage stale — hydra login to refresh`.
 - **Precedence.** A `CLAUDE_CODE_OAUTH_TOKEN` or `CLAUDE_CONFIG_DIR` that the
   caller sets wins, as before.
 - `hydra token work --remove` drops the token and keeps the profile and its
@@ -310,8 +324,16 @@ for any profile that laptop hasn't logged into yet. A long-lived token from
   keeps the last numbers (marked `token stale`) and Claude Code refreshes the
   token itself the next time that profile launches. Only an expired *refresh*
   token needs `hydra login <name>`. A profile with a long-lived token never
-  launches on its browser login, so that login is not refreshed and needs
-  `hydra login <name>` when its usage goes stale.
+  launches on its browser login, so that login is not refreshed. hydra then
+  reads usage on the token (see [Long-lived tokens](#long-lived-tokens-opt-in));
+  `hydra login <name>` brings back the endpoint's figures.
+- Usage read on a long-lived token comes from the headers of one real request,
+  not from the usage endpoint. Each probe uses a little of the profile's quota
+  (about 500 input tokens). The headers give only the 5-hour, weekly and
+  Fable windows, with no severity. On a non-Fable intent the Fable window
+  stays unknown. Claude Code labels these fields `@internal`, so a new
+  version can change them; a probe that finds none shows
+  `token, usage unknown`.
 - If the same account is used on two machines, each machine's cache only knows
   what it fetched; the reset-time decay keeps it from being pessimistic, and
   the next launch refreshes it.

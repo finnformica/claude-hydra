@@ -421,13 +421,75 @@ model_label() { case "$1" in *fable*) printf 'fable' ;; *opus*) printf 'opus' ;;
 
 claude_version() { local b; b=$(claude_bin 2>/dev/null) || return 0; "$b" --version 2>/dev/null | awk '{print $1}'; }
 
+# A setup-token token cannot read the usage endpoint (no user:profile), but the
+# limiter puts anthropic-ratelimit-unified-* headers on every inference reply,
+# and Claude Code (2.1.302) reports them in stream-json as
+# rate_limit_event.rate_limit_info.unifiedWindows: five_hour and seven_day, plus
+# seven_day_overage_included (the Fable weekly window) on a Fable request only,
+# each {utilization 0-1, resetsAt epoch}. A refused (429) reply carries no
+# windows, only status "rejected" and the rateLimitType that refused it.
+# So: one minimal request on the token — no tools, no session file, no settings,
+# a one-line system prompt — on haiku, or on Fable when the intent is Fable and
+# that window can bind. It is a real request, so only a refresh runs it, never
+# a launch. Writes the usual cache record with source "token"; returns 1 (and
+# writes nothing) when the reply held no windows, 2 when the profile was
+# probed less than MIN_REFRESH_S ago — the floor holds even after a failure,
+# which leaves fetched_at where it was.
+token_usage() {
+  local name="$1" dir="$2" tok model wd out cache="$CACHE_DIR/$name.json" last
+  tok=$(stored_token "$dir") || return 1
+  last=$(cat "$CACHE_DIR/$name.probe" 2>/dev/null || printf '0')
+  [ $(( $(now) - ${last:-0} )) -ge "$MIN_REFRESH_S" ] 2>/dev/null || return 2
+  model=haiku; [ "$(model_label "$(model_intent)")" = fable ] && model=fable
+  mkdir -p "$CACHE_DIR"; out="$CACHE_DIR/$name.probe.$$"
+  printf '%s' "$(now)" >"$out.t" && mv "$out.t" "$CACHE_DIR/$name.probe"
+  wd=$(mktemp -d "${TMPDIR:-/tmp}/hydra-probe.XXXXXX") || return 1
+  ( cd "$wd" && CLAUDE_CODE_OAUTH_TOKEN="$tok" run_claude "$dir" -p --output-format stream-json --verbose \
+      --model "$model" --tools "" --strict-mcp-config --no-session-persistence --disable-slash-commands \
+      --setting-sources "" --system-prompt 'Reply with OK.' 'OK' ) </dev/null >"$out" 2>/dev/null || true
+  rmdir "$wd" 2>/dev/null || rm -rf "$wd"
+  jq -Rn --arg at "$(now)" --argjson fable "$([ "$model" = fable ] && echo true || echo false)" '
+    def row($kind; $group; $scope; w):
+      if w == null or w.utilization == null then empty
+      else {kind: $kind, group: $group, percent: (w.utilization * 100 + 0.5 | floor), severity: null,
+            resets_at: (if w.resetsAt == null then null else (w.resetsAt | floor | todate) end), scope: $scope} end;
+    [inputs | fromjson? | select(type == "object" and .type == "rate_limit_event") | .rate_limit_info] as $ev
+    | ($ev | map(select(.unifiedWindows != null)) | last | .unifiedWindows) as $w
+    | ($ev | last) as $last
+    | {model: {id: null, display_name: "Fable"}, surface: null} as $fs
+    # A refusal names its window but carries no figures: that window is full.
+    | (if ($last.status // "") == "rejected" then {($last.rateLimitType // ""): {utilization: 1, resetsAt: $last.resetsAt}} else {} end) as $r
+    | [row("session"; "session"; null; ($r.five_hour // $w.five_hour)),
+       row("weekly_all"; "weekly"; null; ($r.seven_day // $w.seven_day)),
+       (if $fable then row("weekly_scoped"; "weekly"; $fs; ($r.seven_day_overage_included // $w.seven_day_overage_included)) else empty end)]
+    | if length == 0 then error("no windows")
+      else {fetched_at: ($at | tonumber), source: "token", auth: "ok", limits: ., locked: []} end
+  ' <"$out" >"$out.2" 2>/dev/null && mv "$out.2" "$cache"   # atomic, like fetch_usage
+  local rc=$?
+  rm -f "$out" "$out.2"
+  return "$rc"
+}
+
 # Fetches /api/oauth/usage for one profile into the cache. Prints a status word.
+# A profile with a token and no usable browser login (none, or a 401) falls
+# back to token_usage, unless --no-probe (a foreground caller that must not
+# spend a request).
 fetch_usage() {
-  local name="$1" dir token code creds
+  local name="$1" dir token="" code creds probe=1
+  [ "${2:-}" = "--no-probe" ] && probe=0
   dir=$(profile_dir "$name")
-  creds=$(credentials "$dir") || { printf 'no-auth'; return 0; }
-  token=$(printf '%s' "$creds" | jq -r '.claudeAiOauth.accessToken // empty')
-  [ -n "$token" ] || { printf 'no-auth'; return 0; }
+  if creds=$(credentials "$dir"); then token=$(printf '%s' "$creds" | jq -r '.claudeAiOauth.accessToken // empty'); fi
+  if [ -z "$token" ]; then
+    if [ "$probe" -eq 0 ] || ! has_token "$dir"; then printf 'no-auth'; return 0; fi
+    local rc=0; token_usage "$name" "$dir" || rc=$?
+    case "$rc" in 0) printf 'ok (token)'; return 0 ;; 2) printf 'fresh (token probed recently)'; return 0 ;; esac
+    # Recorded, so the failure shows ("token, usage unknown") and the
+    # MIN_REFRESH_S floor holds against a probe on every launch.
+    mkdir -p "$CACHE_DIR"
+    printf '{"fetched_at":%s,"source":"token","auth":"failed","limits":[],"locked":[]}' "$(now)" >"$CACHE_DIR/$name.tmp.$$" &&
+      mv "$CACHE_DIR/$name.tmp.$$" "$CACHE_DIR/$name.json"
+    printf 'probe-failed'; return 0
+  fi
 
   mkdir -p "$CACHE_DIR"
   local tmp="$CACHE_DIR/$name.tmp.$$" cache="$CACHE_DIR/$name.json"
@@ -451,6 +513,8 @@ fetch_usage() {
       fi ;;
     401)
       # The access token has lapsed; Claude refreshes it itself on next launch.
+      # A token session never refreshes it, so read usage on the token instead.
+      if [ "$probe" -eq 1 ] && has_token "$dir" && token_usage "$name" "$dir"; then rm -f "$tmp"; printf 'ok (token)'; return 0; fi   # 1 or 2: keep the stale record
       if [ -f "$cache" ]; then jq '.auth = "stale"' "$cache" >"$tmp.2" && mv "$tmp.2" "$cache"
       else printf '{"fetched_at":0,"source":"api","auth":"stale","limits":[],"locked":[]}' >"$cache"; fi
       printf 'stale' ;;
@@ -514,10 +578,12 @@ JQ_LIB='
                      else b.pct end;
   # Why a profile is (or is not) usable, first reason wins. The status table and
   # `status --json` both read it from here so the two can never disagree.
+  # Usage read on the long-lived token (token_usage), not the browser login.
+  def token_usage: .source == "token" and .auth == "ok";
   def state($threshold):
-    # A token launches but cannot read usage (it lacks user:profile), so a
-    # profile with one and no browser login is launchable but unranked.
-    if (.signed_in | not) then (if .token then "token, usage unknown" else "not signed in on this machine" end)
+    # With no browser login, only a token probe gives a profile usage; until
+    # one succeeds it launches but is unranked.
+    if (.signed_in | not) and (token_usage | not) then (if .token then "token, usage unknown" else "not signed in on this machine" end)
     elif .disabled then "disabled"
     elif .locked then "locked"
     elif ([.session.pct, .weekly.pct, .fable.pct] | map(. // 0) | max) >= $threshold then "exhausted"
@@ -568,9 +634,9 @@ snapshots() {
 
 # Refreshes profiles whose data is older than MIN_REFRESH_S (or all with --force).
 refresh() {
-  local force=0 names="" n status t age
+  local force=0 names="" n status t age probe=""
   while [ $# -gt 0 ]; do
-    case "$1" in --force) force=1 ;; --stale) ;; *) names="$names $1" ;; esac; shift
+    case "$1" in --force) force=1 ;; --stale) ;; --no-probe) probe=--no-probe ;; *) names="$names $1" ;; esac; shift
   done
   # Bare `refresh` covers every profile, disabled ones included: it is "fetch
   # usage now", and status shows the disabled rows. Only the launch path narrows
@@ -584,7 +650,7 @@ refresh() {
       age=$(( t - $(snapshot "$n" | jq -r '.fetched_at') ))
       [ "$age" -ge "$MIN_REFRESH_S" ] || { printf '%-12s fresh (%ss ago)\n' "$n" "$age"; continue; }
     fi
-    status=$(fetch_usage "$n")
+    status=$(fetch_usage "$n" $probe)
     printf '%-12s %s\n' "$n" "$status"
   done
   SNAPSHOTS=""
@@ -626,8 +692,8 @@ rank_json() {
     # A profile is "known" once a fetch has returned real data, even when that
     # data has no 5-hour bucket (no activity yet this window). Gate eligibility
     # on a fetch having happened at all, not on the 5-hour bucket specifically.
-    # A token-only profile (no browser login) has no usage of its own to trust.
-    | map(. + {known: (.signed_in and .fetched_at > 0), intent: $intent})
+    # A token-only profile (no browser login) is known once a token probe read it.
+    | map(. + {known: ((.signed_in or token_usage) and .fetched_at > 0), intent: $intent})
     | map(. + {exhausted: (.locked or (([.s, .w, .f] | map(. // 0) | max) >= $threshold))})
     | map(. + {score: ((.s // 0) * $ws + (if $fable then ([(.w // 0) * $ww, (.f // 0) * $wf] | max) else (.w // 0) * $ww end))})
     | map(. + {load: (.score + .live * $cost)})
@@ -849,7 +915,7 @@ cmd_remove() {
       esac
     fi
   fi
-  rm -f "$CACHE_DIR/$name.json"
+  rm -f "$CACHE_DIR/$name.json" "$CACHE_DIR/$name.probe"
   manifest | jq --arg n "$name" 'del(.profiles[$n])' | save_manifest
   say "removed '$name'"
 }
@@ -911,7 +977,7 @@ cmd_token() {
   printf '%s\n' "$tok" | store_token "$dir"
   if use_keychain; then say "stored the token for '$name' in the Keychain ($(token_service "$dir"))"
   else say "stored the token for '$name' in $(contract "$dir")/$TOKEN_FILE (mode 600)"; fi
-  say "launches on '$name' now use it; usage still comes from its browser login (hydra token $name --remove to drop it)"
+  say "launches on '$name' now use it; usage comes from its browser login, or from one small request on the token when that login is missing or lapsed (hydra token $name --remove to drop it)"
 }
 
 cmd_rename() {
@@ -923,6 +989,7 @@ cmd_rename() {
   # The config dir (and so the Keychain item) stays put; only the label changes.
   manifest | jq --arg o "$old" --arg n "$new" '.profiles[$n] = .profiles[$o] | del(.profiles[$o])' | save_manifest
   [ -f "$CACHE_DIR/$old.json" ] && mv "$CACHE_DIR/$old.json" "$CACHE_DIR/$new.json"
+  [ -f "$CACHE_DIR/$old.probe" ] && mv "$CACHE_DIR/$old.probe" "$CACHE_DIR/$new.probe"
   say "renamed '$old' → '$new'"
 }
 
@@ -973,7 +1040,9 @@ cmd_status() {
     fi
   fi
   if [ "$cached" -eq 0 ]; then
-    if [ "$force" -eq 1 ]; then refresh --force >/dev/null; else refresh --stale >/dev/null; fi
+    # A token probe is a real request: status leaves it to `hydra refresh`
+    # and to the background refresh after a launch.
+    if [ "$force" -eq 1 ]; then refresh --force --no-probe >/dev/null; else refresh --stale --no-probe >/dev/null; fi
   fi
   local threshold; threshold=$(manifest | jq -r '.threshold // 90')
   if [ "$json" -eq 1 ]; then
@@ -1016,14 +1085,16 @@ cmd_pick() {
 ensure_usage() {
   local missing
   missing=$(snapshots | jq -r '.[] | select(.signed_in and (.disabled | not) and .fetched_at == 0) | .name')
-  [ -n "$missing" ] && refresh --force $missing >/dev/null 2>&1 || true
+  [ -n "$missing" ] && refresh --force --no-probe $missing >/dev/null 2>&1 || true
 }
 
-# Kicks off a refresh of stale profiles without holding up the launch.
+# Kicks off a refresh of stale profiles without holding up the launch. A
+# token-only profile is refreshed here too: its token probe must never run in
+# the launch itself.
 background_refresh() {
   local stale
   stale=$(snapshots | jq -r --argjson now "$(now)" --argjson min "$MIN_REFRESH_S" \
-    '.[] | select(.signed_in and (.disabled | not) and ($now - .fetched_at) >= $min) | .name' | tr '\n' ' ')
+    '.[] | select((.signed_in or .token) and (.disabled | not) and ($now - .fetched_at) >= $min) | .name' | tr '\n' ' ')
   [ -n "${stale// /}" ] || return 0
   ( "$0" refresh --force $stale >/dev/null 2>&1 & ) >/dev/null 2>&1
 }
