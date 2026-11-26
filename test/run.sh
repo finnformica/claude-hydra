@@ -109,7 +109,8 @@ EOF
 # CLAUDE_CODE_OAUTH_TOKEN it was given and its args (so an "update" to a new version
 # is visible); `auth login` writes a fake sign-in; `setup-token` draws $FAKE_TOKEN on
 # its "screen" in colour, as the real TUI does; `-p` under a token is the token check,
-# which passes only for $FAKE_TOKEN and only while FAKE_TOKEN_OK is yes.
+# which passes only for $FAKE_TOKEN and only while FAKE_TOKEN_OK is yes; `-p` under a
+# token with stream-json is the usage probe, which prints $FAKE_LIMITS (if set).
 fake_claude() {
   cat >"$1" <<EOF
 #!/bin/sh
@@ -128,6 +129,11 @@ if [ "\$1" = "setup-token" ]; then
   exit 0
 fi
 if [ "\$1" = "-p" ] && [ -n "\${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  case " \$* " in *" stream-json "*)
+    printf 'probe cwd=%s\\n' "\$PWD" >>"\$FAKE_LOG"
+    case "\$CLAUDE_CODE_OAUTH_TOKEN" in sk-ant-oat*) [ -n "\${FAKE_LIMITS:-}" ] && cat "\$FAKE_LIMITS" ;; esac
+    exit 0 ;;
+  esac
   [ "\${FAKE_TOKEN_OK:-yes}" = yes ] && [ "\$CLAUDE_CODE_OAUTH_TOKEN" = "\$FAKE_TOKEN" ]; exit \$?
 fi
 printf 'version=%s\\n' "$2"
@@ -198,6 +204,22 @@ tool_path() {
   printf '%s' "$SB/toolbin"
 }
 manifest() { cat "$HYDRA_HOME/profiles.json"; }
+# limits <5h> <weekly> [fable] [status] [type]: a probe's stream-json, the shape Claude Code
+# 2.1.302 prints — utilization as a 0-1 fraction, resets as epoch seconds; "-" leaves a window
+# out; status "rejected" drops every window, as a refused (429) reply does.
+limits() {
+  local s=$1 w=$2 f=${3:--} st=${4:-allowed} ty=${5:-seven_day} r=$((NOW + 3600)) wr=$((NOW + 86400)) win=""
+  [ "$s" = - ] || win="\"five_hour\":{\"utilization\":$s,\"resetsAt\":$r}"
+  [ "$w" = - ] || win="${win:+$win,}\"seven_day\":{\"utilization\":$w,\"resetsAt\":$wr}"
+  [ "$f" = - ] || win="${win:+$win,}\"seven_day_overage_included\":{\"utilization\":$f,\"resetsAt\":$wr}"
+  if [ "$st" = rejected ] || [ -z "$win" ]; then win=""; else win=",\"unifiedWindows\":{$win}"; fi
+  printf '{"type":"system","subtype":"init"}\nnot json\n'
+  printf '{"type":"rate_limit_event","rate_limit_info":{"status":"%s","resetsAt":%s,"rateLimitType":"%s"%s}}\n' \
+    "$st" "$([ "$ty" = five_hour ] && echo "$r" || echo "$wr")" "$ty" "$win"
+  printf '{"type":"result","is_error":false}\n'
+}
+probe_count() { grep -c '^probe ' "$FAKE_LOG" 2>/dev/null | tr -d ' '; }
+
 # put_token <name> [token]: a stored token as hydra token leaves it (file form, mode 600)
 put_token() { local d; d=$("$HYDRA" dir "$1"); mkdir -p "$d"; ( umask 077; printf '%s' "${2:-sk-ant-oat01-$1}" >"$d/.hydra-oauth-token" ); }
 mode_of() { ls -l "$1" | cut -c1-10; }
@@ -1408,6 +1430,83 @@ if test "token: status shows it; a token-only profile is 'usage unknown' yet lau
   add d; set_usage d 1 1 1; put_token d; FAKE_CURL_CODE=401 "$HYDRA" refresh --force d >/dev/null
   assert_eq "a token profile whose login lapsed says what will fix it" "token, usage stale — hydra login to refresh" \
     "$(statusj '.profiles[] | select(.name == "d") | .state' --cached)"
+fi
+
+if test "token usage: a token profile with no browser login is probed and ranks like any other"; then
+  add a; add c "" --no-login; set_usage a 50 50 50; put_token c
+  limits 0.42 0.17 0.08 >"$SB/limits"; export FAKE_LIMITS="$SB/limits"
+  out=$("$HYDRA" refresh c)
+  assert_contains "refresh reads it on the token" "ok (token)" "$out"
+  assert_eq "one probe" "1" "$(probe_count)"
+  assert_eq "the canned percentages, in the usual record" "42 17 8 token" \
+    "$(statusj '.profiles[] | select(.name == "c") | "\(.session.pct) \(.weekly.pct) \(.fable.pct) \(.source)"' --cached)"
+  assert_eq "resets come through as times" "3600" "$(statusj ".profiles[] | select(.name == \"c\") | .session.resets - $NOW" --cached)"
+  assert_eq "state: ok" "ok" "$(statusj '.profiles[] | select(.name == "c") | .state' --cached)"
+  assert_contains "the table agrees" "yes    ok" "$("$HYDRA" status --cached | grep '^c ')"
+  assert_eq "it ranks on its numbers: c beats a" "c" "$(pick)"
+  log=$(cat "$FAKE_LOG")
+  assert_contains "Fable intent: a Fable request" "--model fable" "$log"
+  assert_contains "no tools" "--tools  --strict-mcp-config" "$log"
+  assert_contains "no session file" "--no-session-persistence" "$log"
+  assert_contains "no settings" "--setting-sources" "$log"
+  assert_not_contains "the token is in no argv" "sk-ant-oat01-c" "$log"
+  assert_not_contains "…and in no cache file" "sk-ant-oat01-c" "$(cat "$HYDRA_HOME"/cache/* 2>/dev/null)"
+  assert_not_contains "the probe runs outside the caller's dir" "probe cwd=$PWD" "$log"
+  "$HYDRA" refresh c >/dev/null; "$HYDRA" refresh --force c >/dev/null
+  assert_eq "MIN_REFRESH_S holds per profile, --force included" "1" "$(probe_count)"
+  HYDRA_NOW=$((NOW + 180)) "$HYDRA" refresh c >/dev/null
+  assert_eq "…and lets the next one through" "2" "$(probe_count)"
+fi
+
+if test "token usage: a non-Fable intent probes on haiku and leaves the Fable window out"; then
+  add c "" --no-login; put_token c
+  limits 0.10 0.20 >"$SB/limits"; export FAKE_LIMITS="$SB/limits" HYDRA_MODEL=sonnet
+  "$HYDRA" refresh c >/dev/null
+  assert_contains "haiku" "--model haiku" "$(cat "$FAKE_LOG")"
+  assert_eq "5h and week, no Fable" "10 20 null" "$(statusj '.profiles[] | select(.name == "c") | "\(.session.pct) \(.weekly.pct) \(.fable.pct)"' --cached)"
+fi
+
+if test "token usage: a refused probe reads as exhausted"; then
+  add c "" --no-login; put_token c
+  limits - - - rejected five_hour >"$SB/limits"; export FAKE_LIMITS="$SB/limits"
+  "$HYDRA" refresh c >/dev/null
+  assert_eq "the refusing window is full" "100 exhausted" "$(statusj '.profiles[] | select(.name == "c") | "\(.session.pct) \(.state)"' --cached)"
+fi
+
+if test "token usage: a failed probe keeps 'token, usage unknown'"; then
+  add a; add c "" --no-login; set_usage a 50 50 50; put_token c
+  limits - - >"$SB/limits"; export FAKE_LIMITS="$SB/limits"   # a reply with no windows
+  assert_contains "refresh says so" "probe-failed" "$("$HYDRA" refresh c)"
+  assert_eq "state" "token, usage unknown" "$(statusj '.profiles[] | select(.name == "c") | .state' --cached)"
+  assert_eq "it ranks after the known profile" "a" "$(pick)"
+  unset FAKE_LIMITS
+  HYDRA_NOW=$((NOW + 60)) "$HYDRA" refresh c >/dev/null
+  assert_eq "the failure holds the floor too" "1" "$(probe_count)"
+  HYDRA_NOW=$((NOW + 200)) "$HYDRA" refresh c >/dev/null
+  assert_eq "no output at all is a failure as well" "token, usage unknown" "$(HYDRA_NOW=$((NOW + 200)) "$HYDRA" status --json --cached | jq -r '.profiles[] | select(.name == "c") | .state')"
+fi
+
+if test "token usage: a login that answers 401 falls back to the token; status and pick never probe"; then
+  add d; set_usage d 60 60 60; put_token d
+  limits 0.05 0.06 0.07 >"$SB/limits"; export FAKE_LIMITS="$SB/limits"
+  FAKE_CURL_CODE=401 "$HYDRA" status --force >/dev/null
+  assert_eq "status leaves the probe to refresh" "0" "$(probe_count)"
+  assert_eq "…so the stale text stays" "token, usage stale — hydra login to refresh" "$(statusj '.profiles[] | select(.name == "d") | .state' --cached)"
+  add c "" --no-login; put_token c; pick >/dev/null
+  assert_eq "pick does not probe either" "0" "$(probe_count)"
+  FAKE_CURL_CODE=401 "$HYDRA" refresh --force d >/dev/null
+  assert_eq "refresh reads it on the token" "5 6 7 ok token" \
+    "$(statusj '.profiles[] | select(.name == "d") | "\(.session.pct) \(.weekly.pct) \(.fable.pct) \(.state) \(.source)"' --cached)"
+fi
+
+if test "token usage: a profile with no token never probes"; then
+  add a; limits 0.5 0.5 0.5 >"$SB/limits"; export FAKE_LIMITS="$SB/limits"
+  "$HYDRA" refresh a >/dev/null; FAKE_CURL_CODE=401 "$HYDRA" refresh --force a >/dev/null
+  assert_eq "no probe" "0" "$(probe_count)"
+  assert_eq "the endpoint's record, as before" "api token stale — refreshes on next launch" \
+    "$(statusj '.profiles[] | select(.name == "a") | "\(.source) \(.state)"' --cached)"
+  add b "" --no-login; "$HYDRA" refresh b >/dev/null
+  assert_eq "no login, no token: still not signed in" "not signed in on this machine" "$(statusj '.profiles[] | select(.name == "b") | .state' --cached)"
 fi
 
 if test "token: --remove drops only the token; remove takes it with the profile"; then

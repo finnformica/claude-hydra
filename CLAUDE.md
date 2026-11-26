@@ -75,17 +75,32 @@ a hydra-owned Keychain item `hydra-oauth-token-<sha8 of the dir string>`
 put it in argv (`store_token` feeds `security -i` on stdin), or write it
 anywhere else. `status --json` carries a `token` boolean, never the value.
 
-**A long-lived token is inference-only, so it is opt-in and never ranks.**
+**A long-lived token is inference-only, so it is opt-in and reads usage another way.**
 `claude setup-token` asks for the scope `user:inference` alone (`inferenceOnly`
 in the 2.1.302 bundle), and with `CLAUDE_CODE_OAUTH_TOKEN` set Claude Code uses
 that token ahead of the stored login, with no refresh token. The usage
 endpoint needs `user:profile` (Claude Code's own `/usage` fetch is gated on it),
-so `fetch_usage` and the teleport probe keep reading `credentials` — the
-browser login. A token session never refreshes that login, so it goes stale;
-`state` says `token, usage stale — hydra login to refresh`. A profile with a
-token and no login is `token, usage unknown`: `rank_json` keeps it
-(`signed_in or token`) but it is not `known`, so it ranks last and is still
-launchable. Remote Control, Claude in Chrome, claude.ai MCP connectors and
+so `fetch_usage` and the teleport probe read `credentials` — the browser
+login — first. When there is no login, or the endpoint answers 401,
+`fetch_usage` falls back to `token_usage`: one `claude -p --output-format
+stream-json` on the token (env only; no tools, no session file,
+`--setting-sources ""`, a one-line `--system-prompt`, in an empty temp dir).
+Claude Code 2.1.302 puts the limiter's response headers in
+`rate_limit_event.rate_limit_info.unifiedWindows` — `five_hour`, `seven_day`
+and, on a Fable request only, `seven_day_overage_included` (the Fable window),
+each `{utilization 0-1, resetsAt epoch}`; a refused reply carries none, only
+`status: "rejected"` and its `rateLimitType`. Its gate (`kt()`) needs only
+`user:inference`. So the probe uses Fable when `model_intent` is Fable, haiku
+otherwise, and writes the endpoint's record shape with `source: "token"`;
+`token_usage` in `JQ_LIB` makes such a record count as signed in for `state`
+and as `known` for `rank_json`. The probe is a real request: only `refresh`
+without `--no-probe` runs it (`hydra refresh`, the detached background
+refresh, which now includes `token` profiles); `status` and `ensure_usage`
+pass `--no-probe`. Its own floor (`cache/<name>.probe`, `MIN_REFRESH_S`)
+holds even for `--force` and after a failure. A failed probe with no login
+writes `auth: "failed"` → `token, usage unknown` (ranked last, still
+launchable); after a 401 it keeps the stale record → `token, usage stale —
+hydra login to refresh`. Remote Control, Claude in Chrome, claude.ai MCP connectors and
 teleport refuse the token, so `needs_full_login` (any `PASSTHROUGH` subcommand,
 `--teleport`, `--remote-control`, `--chrome`) launches without it.
 `hydra token` reads `setup-token`'s TUI through `script(1)` and a pipe
@@ -252,7 +267,7 @@ manifest:
 5. `load` = `score + live × live_cost` (manifest, default 5): a run in flight
    will consume more than the reading shows yet.
 6. `eligible` = enabled, not exhausted, known (a fetch has happened and the
-   profile is signed in, so a token-only profile is never known). `best` = the lowest eligible
+   profile is signed in, or a token probe read it — `token_usage`). `best` = the lowest eligible
    load; `in_band` = eligible and `load <= best + tolerance` (manifest, default
    10). The band is hysteresis over coarse, lagging integers.
 7. Sort by: enabled first, non-exhausted first, known-before-unknown, in-band
@@ -271,7 +286,9 @@ Each test runs in a sandbox (`sandbox()` in `test/run.sh`): a throwaway `$HOME`
 with a fake `~/.claude`, `HYDRA_HOME` under it (so `~` contraction works), a
 fake `claude` (records args and prints the `CLAUDE_CODE_OAUTH_TOKEN` it got;
 `auth login` writes fake credentials; `setup-token` draws `$FAKE_TOKEN` in colour;
-`-p` under a token is the token check, failing when `FAKE_TOKEN_OK=no`) and a fake
+`-p` under a token is the token check, failing when `FAKE_TOKEN_OK=no`; with
+`stream-json` it is the usage probe and prints `$FAKE_LIMITS`, which `limits <5h>
+<weekly> [fable] [status] [type]` builds; `probe_count` counts probes) and a fake
 `curl` (serves `$FAKE_CURL_BODY` with `$FAKE_CURL_CODE`) first on `PATH`,
 `HYDRA_NO_KEYCHAIN=1` so credentials are files, and `HYDRA_NOW` for a fixed
 clock. `put_token <name> [token]` stores a token the way `hydra token` does. `usage <5h> <weekly> <fable> [resets…]` builds an endpoint body;
